@@ -37,7 +37,7 @@ MAX_INT = np.iinfo(np.int32).max
 
 def _parallel_evolve(n_programs, parents, X, y, sample_weight, seeds, params):
     """Private function used to build a batch of programs within a job."""
-    n_samples, n_features = X.shape
+    n_samples, n_features = X.shape[:2]
     # Unpack parameters
     tournament_size = params['tournament_size']
     function_set = params['function_set']
@@ -132,9 +132,28 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight, seeds, params):
 
         # Draw samples, using sample weights, and then fit
         if sample_weight is None:
-            curr_sample_weight = np.ones((n_samples,))
+            # curr_sample_weight = np.ones((n_samples,))
+            curr_sample_weight = np.ones_like(y, dtype=float)
         else:
             curr_sample_weight = sample_weight.copy()
+        # Broadcast weight matrix to be compatible with y.
+        if y.shape != curr_sample_weight.shape:
+            err_msg = f'Cannot cast sample weight to the shape of y:'\
+                f'{curr_sample_weight.shape} -> {y.shape}'
+            diff = len(y.shape) - len(curr_sample_weight.shape)
+            if diff > 0:
+                # Assume later dims are missing.
+                curr_sample_weight = np.expand_dims(
+                    curr_sample_weight,
+                    axis=np.arange(diff)+len(y.shape),
+                )
+                try:
+                    curr_sample_weight = np.broadcast_to(curr_sample_weight, 
+                                                        y.shape).copy()
+                except Exception:
+                    raise RuntimeError(err_msg)
+            else:
+                raise RuntimeError(err_msg)
         oob_sample_weight = curr_sample_weight.copy()
 
         indices, not_indices = program.get_all_indices(n_samples,
@@ -260,6 +279,81 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                                      run_details['best_fitness'][-1],
                                      oob_fitness,
                                      remaining_time))
+            
+    def _validate_data(self, X, y, **kwargs):
+        """Patch parent's _validate_data() method for n-dim situation. 
+        Both X, y will be checked seperately using same dict of kwargs.
+        
+        Parameters
+        ----------
+        X : {array-like, sparse matrix, dataframe} of shape \
+                (n_samples, n_features, ...), default='no validation'
+            The input samples.
+            If `'no_validation'`, no validation is performed on `X`. This is
+            useful for meta-estimator which can delegate input validation to
+            their underlying estimator(s). In that case `y` must be passed and
+            the only accepted `check_params` are `multi_output` and
+            `y_numeric`.
+
+        y : array-like of shape (n_samples, ...), default='no_validation'
+            The targets.
+            - If `None`, `check_array` is called on `X`. If the estimator's
+              requires_y tag is True, then an error will be raised.
+            - If `'no_validation'`, `check_array` is called on `X` and the
+              estimator's requires_y tag is ignored. This is a default
+              placeholder and is never meant to be explicitly set. In that case
+              `X` must be passed.
+            - Otherwise, both `X` and `y` are checked with `check_array`.
+              
+        kwargs : kwargs
+            Any other kwargs accepted by parent's `check_array`.
+            
+        Returns
+        -------
+        out : {ndarray, sparse matrix} or tuple of these
+            The validated input. A tuple is returned if both `X` and `y` are
+            validated.
+        """
+        x_kwargs = {
+            'force_all_finite': 'allow-nan',
+            'ensure_2d': False,
+            'allow_nd': True,
+            'dtype': 'numeric',
+        }
+        x_kwargs.update(kwargs)
+        y_kwargs = x_kwargs.copy()
+        if isinstance(self, ClassifierMixin):
+            y_kwargs['dtype'] = None
+        out = super()._validate_data(X, y, validate_separately=(x_kwargs, 
+                                                                y_kwargs))
+        if not isinstance(out, tuple):
+            return out
+        # Re-implement `check_consistent_length` in a different fashion.
+        X, y = out
+        X_shape, y_shape = list(X.shape), list(y.shape)
+        if len(X_shape) < 2 or len(y_shape) < 1:
+            raise ValueError(f'Require X to be at least 2d and y to be at '
+                             f'least 1d, received {X_shape}, {y_shape}')
+        multioutput = False
+        if isinstance(self, ClassifierMixin):
+            # Check for multilabel / multioutput. Multiple label must be
+            # placed as last dim of y.
+            multioutput = (len(X_shape) == len(y_shape)) and (y_shape[-1] > 1)
+            # Check class label
+            if np.issubdtype(y.dtype, float):
+                mask = np.isfinite(y)
+                if not (y[mask] == y[mask].astype(int)).all():
+                    raise ValueError('Label y cannot be continuous float.')
+            elif not (np.issubdtype(y.dtype, str) 
+                      or np.issubdtype(y.dtype, int)):
+                raise ValueError(f'Require label y to be int, string or int-'
+                                 f'like float, received {y.dtype}.')
+        del X_shape[1]
+        if multioutput: del y_shape[-1]
+        if X_shape != y_shape:
+            raise ValueError(f'Require shapes of X, y to be matched on all but'
+                             f' n_features dim, received {X_shape}, {y_shape}')
+        return X, y
 
     def fit(self, X, y, sample_weight=None):
         """Fit the Genetic Program according to X, y.
@@ -286,11 +380,13 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
 
         # Check arrays
         if sample_weight is not None:
-            sample_weight = _check_sample_weight(sample_weight, X)
+            # sample_weight = _check_sample_weight(sample_weight, X)
+            assert sample_weight.shape == y.shape, \
+                'Sample weight shape not matched to y'
 
         if isinstance(self, ClassifierMixin):
-            X, y = self._validate_data(X, y, y_numeric=False)
-            check_classification_targets(y)
+            X, y = self._validate_data(X, y)
+            # check_classification_targets(y[0])
 
             if self.class_weight:
                 if sample_weight is None:
@@ -309,7 +405,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             self.n_classes_ = len(self.classes_)
 
         else:
-            X, y = self._validate_data(X, y, y_numeric=True)
+            X, y = self._validate_data(X, y)
 
         hall_of_fame = self.hall_of_fame
         if hall_of_fame is None:
@@ -797,6 +893,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
                  init_method='half and half',
                  function_set=('add', 'sub', 'mul', 'div'),
                  metric='mean absolute error',
+                 transformer=None,
                  parsimony_coefficient=0.001,
                  p_crossover=0.9,
                  p_subtree_mutation=0.01,
@@ -820,6 +917,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
             init_method=init_method,
             function_set=function_set,
             metric=metric,
+            transformer=transformer,
             parsimony_coefficient=parsimony_coefficient,
             p_crossover=p_crossover,
             p_subtree_mutation=p_subtree_mutation,
@@ -858,8 +956,8 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
         if not hasattr(self, '_program'):
             raise NotFittedError('SymbolicRegressor not fitted.')
 
-        X = check_array(X)
-        _, n_features = X.shape
+        X = check_array(X, allow_nd=True, force_all_finite='allow-nan')
+        _, n_features = X.shape[:2]
         if self.n_features_in_ != n_features:
             raise ValueError('Number of features of the model must match the '
                              'input. Model n_features is %s and input '
@@ -1154,8 +1252,8 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
         if not hasattr(self, '_program'):
             raise NotFittedError('SymbolicClassifier not fitted.')
 
-        X = check_array(X)
-        _, n_features = X.shape
+        X = check_array(X, allow_nd=True, force_all_finite='allow-nan')
+        _, n_features = X.shape[:2]
         if self.n_features_in_ != n_features:
             raise ValueError('Number of features of the model must match the '
                              'input. Model n_features is %s and input '
@@ -1484,8 +1582,8 @@ class SymbolicTransformer(BaseSymbolic, TransformerMixin):
         if not hasattr(self, '_best_programs'):
             raise NotFittedError('SymbolicTransformer not fitted.')
 
-        X = check_array(X)
-        _, n_features = X.shape
+        X = check_array(X, allow_nd=True, force_all_finite='allow-nan')
+        _, n_features = X.shape[:2]
         if self.n_features_in_ != n_features:
             raise ValueError('Number of features of the model must match the '
                              'input. Model n_features is %s and input '

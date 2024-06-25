@@ -357,7 +357,8 @@ class _Program(object):
         # Check for single-node programs
         node = self.program[0]
         if isinstance(node, float):
-            return np.repeat(node, X.shape[0])
+            # return np.repeat(node, X.shape[0])
+            return np.full_like(X[:, 0], node, dtype=float)
         if isinstance(node, int):
             return X[:, node]
 
@@ -374,7 +375,10 @@ class _Program(object):
             while len(apply_stack[-1]) == apply_stack[-1][0].arity + 1:
                 # Apply functions that have sufficient arguments
                 function = apply_stack[-1][0]
-                terminals = [np.repeat(t, X.shape[0]) if isinstance(t, float)
+                # terminals = [np.repeat(t, X.shape[0]) if isinstance(t, float)
+                #              else X[:, t] if isinstance(t, int)
+                #              else t for t in apply_stack[-1][1:]]
+                terminals = [np.full_like(X[:, 0], t, dtype=float) if isinstance(t, float)
                              else X[:, t] if isinstance(t, int)
                              else t for t in apply_stack[-1][1:]]
                 intermediate_result = function(*terminals)
@@ -462,8 +466,12 @@ class _Program(object):
         y_pred = self.execute(X)
         if self.transformer:
             y_pred = self.transformer(y_pred)
+        # if y_pred.shape != y.shape:
+        #     import pickle
+        #     print(X.shape, y.shape, y_pred.shape, sample_weight.shape)
+        #     with open('/home/thchu/notebook/dump.pkl', 'wb') as f:
+        #         pickle.dump(self, f)
         raw_fitness = self.metric(y, y_pred, sample_weight)
-
         return raw_fitness
 
     def fitness(self, parsimony_coefficient=None):
