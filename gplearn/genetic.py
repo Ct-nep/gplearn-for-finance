@@ -11,10 +11,12 @@ computer programs.
 
 import itertools
 from abc import ABCMeta, abstractmethod
+from collections import Iterable
 from time import time
 from warnings import warn
 
 import numpy as np
+import pandas as pd
 from joblib import Parallel, delayed
 from scipy.stats import rankdata
 from sklearn.base import BaseEstimator
@@ -204,6 +206,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                  p_point_mutation=0.01,
                  p_point_replace=0.05,
                  max_samples=1.0,
+                 sample_days=None,
                  class_weight=None,
                  feature_names=None,
                  warm_start=False,
@@ -211,7 +214,9 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                  n_jobs=1,
                  verbose=0,
                  random_state=None):
-
+        if sample_days is not None and \
+            (not isinstance(sample_days, int) or sample_days <= 0):
+            raise ValueError('sample_days must be positive integer.')
         self.population_size = population_size
         self.hall_of_fame = hall_of_fame
         self.n_components = n_components
@@ -231,6 +236,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         self.p_point_mutation = p_point_mutation
         self.p_point_replace = p_point_replace
         self.max_samples = max_samples
+        self.sample_days = sample_days
         self.class_weight = class_weight
         self.feature_names = feature_names
         self.warm_start = warm_start
@@ -279,81 +285,203 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                                      run_details['best_fitness'][-1],
                                      oob_fitness,
                                      remaining_time))
-            
-    def _validate_data(self, X, y, **kwargs):
-        """Patch parent's _validate_data() method for n-dim situation. 
-        Both X, y will be checked seperately using same dict of kwargs.
+    
+    def _validate_data(self, X, y, sample_weight=None, fit=False):
+        '''Patch parent's _validate_data() method for n-dim situation.
+        Due to drastic change of behavior, it is no long suitable to
+        rely on sklearn's validate method. By default, if inputs are
+        missing n_samples dim, a newaxis will be added.
+        
+        Support inputs of multiple DataFrame as X and single DataFrame
+        as y. If this is the case, convert them to ndarray and preserve
+        indices.
+        
+        If fit is set to True and self.sample_days is a positive
+        integer, the input will be padded and reshaped so n_days ==
+        sample_days. This is recommend for calling fit() method but
+        unnecessary for predict().
         
         Parameters
         ----------
-        X : {array-like, sparse matrix, dataframe} of shape \
-                (n_samples, n_features, ...), default='no validation'
-            The input samples.
-            If `'no_validation'`, no validation is performed on `X`. This is
-            useful for meta-estimator which can delegate input validation to
-            their underlying estimator(s). In that case `y` must be passed and
-            the only accepted `check_params` are `multi_output` and
-            `y_numeric`.
+        X : List[pd.DataFrame] or array-like of shape (n_features,
+        n_days, n_firms) or (n_samples, n_features, n_days, n_firms)
+            Training vectors, where n_samples is the number of samples,
+            n_features is the number of features, n_days is sequence
+            length of each sample, n_firms is number of firms / stocks.
+            If provided as DataFrames, must have same index / columns,
+            with shape (n_days, n_firms).
 
-        y : array-like of shape (n_samples, ...), default='no_validation'
-            The targets.
-            - If `None`, `check_array` is called on `X`. If the estimator's
-              requires_y tag is True, then an error will be raised.
-            - If `'no_validation'`, `check_array` is called on `X` and the
-              estimator's requires_y tag is ignored. This is a default
-              placeholder and is never meant to be explicitly set. In that case
-              `X` must be passed.
-            - Otherwise, both `X` and `y` are checked with `check_array`.
-              
-        kwargs : kwargs
-            Any other kwargs accepted by parent's `check_array`.
+        y : None, pd.DataFrame or array-like of shape (n_days, n_firms)
+        or (n_samples, n_days, n_firms)
+            Target values, if provided as DataFrame, must have same
+            index / columns with all X DataFrame, with shape (n_days,
+            n_firms).
+
+        sample_weight : optional, None or pd.DataFrame or array-like of
+        shape (n_samples,) or (n_samples, n_days, n_firms) default=None
+            Weights applied to individual samples.
             
+        fit : bool, default=False
+            If set to True and self.sample_days is a positive integer,
+            input data will be padded and reshaped to formulate
+            minibatchs so n_samples >= 1 and n_days == sample_days.
+
         Returns
         -------
-        out : {ndarray, sparse matrix} or tuple of these
-            The validated input. A tuple is returned if both `X` and `y` are
-            validated.
-        """
-        x_kwargs = {
-            'force_all_finite': 'allow-nan',
-            'ensure_2d': False,
-            'allow_nd': True,
-            'dtype': 'numeric',
-        }
-        x_kwargs.update(kwargs)
-        y_kwargs = x_kwargs.copy()
-        if isinstance(self, ClassifierMixin):
-            y_kwargs['dtype'] = None
-        out = super()._validate_data(X, y, validate_separately=(x_kwargs, 
-                                                                y_kwargs))
-        if not isinstance(out, tuple):
-            return out
-        # Re-implement `check_consistent_length` in a different fashion.
-        X, y = out
-        X_shape, y_shape = list(X.shape), list(y.shape)
-        if len(X_shape) < 2 or len(y_shape) < 1:
-            raise ValueError(f'Require X to be at least 2d and y to be at '
-                             f'least 1d, received {X_shape}, {y_shape}')
-        multioutput = False
-        if isinstance(self, ClassifierMixin):
-            # Check for multilabel / multioutput. Multiple label must be
-            # placed as last dim of y.
-            multioutput = (len(X_shape) == len(y_shape)) and (y_shape[-1] > 1)
-            # Check class label
-            if np.issubdtype(y.dtype, float):
-                mask = np.isfinite(y)
-                if not (y[mask] == y[mask].astype(int)).all():
-                    raise ValueError('Label y cannot be continuous float.')
-            elif not (np.issubdtype(y.dtype, str) 
-                      or np.issubdtype(y.dtype, int)):
-                raise ValueError(f'Require label y to be int, string or int-'
-                                 f'like float, received {y.dtype}.')
-        del X_shape[1]
-        if multioutput: del y_shape[-1]
-        if X_shape != y_shape:
-            raise ValueError(f'Require shapes of X, y to be matched on all but'
-                             f' n_features dim, received {X_shape}, {y_shape}')
-        return X, y
+        X : array-like of shape (n_samples, n_features, n_days, n_firms)
+            X converted to compatible shape.
+            
+        y : None or array-like of shape (n_samples, n_days, n_firms)
+            y converted to compatible shape.
+            
+        sample_weight : array-like of shape (n_samples, n_days, n_firms)
+            sample_weight converted to compatible shape. If not
+            provided, will be np.ones_like(y, dtype=float).
+            
+        index: Union[int, pd.Index]
+            If X, y are DataFrames, preserve index, otherwise is
+            length of original panel data.
+            
+        columns: Union[int, pd.Index]
+            If X, y are DataFrames, preserve columns, otherwise is
+            width of original panel data.
+        '''
+        idx, col = None, None
+        if y is None and sample_weight is not None:
+            raise ValueError('Input y is missing.')
+        # Convert DataFrames to ndarray
+        if (isinstance(y, pd.DataFrame) or y is None) \
+            and isinstance(X, Iterable) \
+            and all([isinstance(i, pd.DataFrame) for i in X]):
+            warn(f'Received DataFrames as input, try converting.')
+            if y is not None:
+                size, idx, col = y.shape, y.index, y.columns
+            else:
+                size, idx, col = X[0].shape, X[0].index, X[0].columns
+            if not all([i.shape==size and (i.index==idx).all() \
+                        and (i.columns==col).all() for i in X]):
+                raise ValueError('All X DataFrames and y must have same '
+                                 'shape, indices and columns')
+            X = np.stack([i.to_numpy() for i in X], axis=0)[None, ...]
+            if y is not None:
+                y = y.to_numpy()[None, ...]
+            if sample_weight is not None:
+                if not isinstance(sample_weight, pd.DataFrame) \
+                    or sample_weight.shape != size \
+                    or sample_weight.index != idx \
+                    or sample_weight.columns != col:
+                    raise ValueError('Sample weight must also be DataFrame and'
+                                     ' with same shape, index and columns.')
+                sample_weight = sample_weight.to_numpy()[None, ...]
+        if not isinstance(X, np.ndarray) \
+            or not (isinstance(y, np.ndarray) or y is None):
+            raise ValueError(f'Cannot coerce X, y with type {type(X)}, '
+                            f'{type(y)} to compatible data structure.')
+        if idx is None:
+            idx, col = X.shape[2], X.shape[3]
+        # Ensure numeric inputs except for classifier's y
+        X = super()._validate_data(X, force_all_finite='allow-nan', 
+                                   reset=fit, ensure_2d=False, 
+                                   allow_nd=True, dtype='numeric')
+        super()._check_n_features(X, reset=fit)
+        if y is not None:
+            y_dtype = None if isinstance(y, ClassifierMixin) else 'numeric'
+            y = check_array(y, force_all_finite='allow-nan',
+                            ensure_2d=False, allow_nd=True, dtype=y_dtype)
+        msg = f'Received X, y with shape {X.shape}, '\
+        f'{"" if y is None else y.shape}, assume n_samples dim is missing.'
+        if len(X) == 3 or (y is not None and len(y) == 2):
+            warn(msg)
+            if len(X) == 3:  X = X[None, ...]
+        if y is not None:
+            if len(y) == 2: y = y[None, ...]
+            X_shape, y_shape = list(X.shape), list(y.shape)
+            msg = f'X, y have incorrect shape {X.shape}, {y.shape}'
+            if len(X_shape) > 1: 
+                del X_shape[1]
+            else:
+                raise ValueError(msg)
+            if (not len(X_shape) == len(y_shape) == 3) \
+                or X_shape != y_shape:
+                raise ValueError(msg)
+        if sample_weight is not None:
+            if not isinstance(sample_weight, np.ndarray):
+                raise ValueError('Sample weight must also be ndarray.')
+            if len(sample_weight.shape) == 1 \
+                and sample_weight.shape[0] == y.shape[0]:
+                sample_weight = sample_weight[:, None, None]  
+            elif len(sample_weight.shape) == 2:
+                sample_weight = sample_weight[None, ...]
+            try:
+                sample_weight = np.broadcast_to(sample_weight[:, None, None], 
+                                                y.shape)
+            except Exception as e:
+                raise ValueError(f'Cannot coerce shape of sample ' 
+                                 f'weight with y: {e}')
+        # Check class label, convert all inputs to float if possible
+        # since it is expected to have nans.
+        if y is not None:
+            if isinstance(self, ClassifierMixin):
+                if np.issubdtype(y.dtype, float):
+                    mask = np.isfinite(y)
+                    if not (y[mask] == y[mask].astype(int)).all():
+                        raise ValueError('y cannot be continuous float.')
+                elif np.issubdtype(y.dtype, int):
+                    y = y.astype(float)
+                elif not np.issubdtype(y.dtype, str):
+                    raise ValueError(f'Require label y to be int, string or '
+                                     f'int-like float, received {y.dtype}.')
+            elif not np.issubdtype(y.dtype, float):
+                y = y.astype(float)
+        if not np.issubdtype(X.dtype, float): 
+            X = X.astype(float)
+        if sample_weight is None:
+            if y is not None:
+                sample_weight = np.ones_like(y, dtype=float)
+        elif not np.issubdtype(sample_weight.dtype, float):
+            sample_weight = sample_weight.astype(float)
+        # Reshape inputs to satisfy self.sample_days
+        if fit:
+            X, y, sample_weight = self._pad_and_reshape(X, y, sample_weight)
+        return X, y, sample_weight, idx, col
+    
+    def _pad_and_reshape(self, X, y, sample_weight):
+        '''If self.sample_days is specified, this method will pad and
+        reshape inputs so n_days == sample_days.
+        
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features, n_days, n_firms)
+
+        y : None or array-like of shape (n_samples, n_days, n_firms)
+
+        sample_weight : None or array-like of shape 
+        (n_samples, n_days, n_firms)
+
+        Returns
+        -------
+        X : array-like of shape (n_samples, n_features, sample_days, n_firms)
+
+        y : None or array-like of shape (n_samples, sample_days, n_firms)
+
+        sample_weight : None or array-like of shape 
+        (n_samples, sample_days, n_firms)
+        '''
+        if self.sample_days is not None and self.sample_days != X.shape[2]:
+            n_samples, n_days, n_firms = X.shape[0], X.shape[2], X.shape[3]
+            pad = (n_samples*n_days) % self.sample_days
+            fn = lambda arr: \
+                np.pad(
+                    arr.reshape(-1, n_firms), 
+                    ((0, pad), (0, 0)), 
+                    'constant', 
+                    constant_values=np.str_(np.nan) \
+                        if np.issubdtype(arr.dtype, str) else np.nan
+                ).reshape(-1, self.sample_days, n_firms)
+            if y is not None: y = fn(y)
+            if sample_weight is not None: sample_weight = fn(sample_weight)
+            X = np.stack([fn(X[:, i]) for i in range(X.shape[1])], axis=1)
+        return X, y, sample_weight
 
     def fit(self, X, y, sample_weight=None):
         """Fit the Genetic Program according to X, y.
@@ -378,22 +506,17 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         """
         random_state = check_random_state(self.random_state)
 
-        # Check arrays
-        if sample_weight is not None:
-            # sample_weight = _check_sample_weight(sample_weight, X)
-            assert sample_weight.shape == y.shape, \
-                'Sample weight shape not matched to y'
-
+        X, y, sample_weight, _, _ = \
+            self._validate_data(X, y, sample_weight, fit=True)
         if isinstance(self, ClassifierMixin):
-            X, y = self._validate_data(X, y)
-            # check_classification_targets(y[0])
-
+            n_samples, n_days, n_firms = y.shape
             if self.class_weight:
-                if sample_weight is None:
-                    sample_weight = 1.
                 # modify the sample weights with the corresponding class weight
+                sample_weight = sample_weight.reshape(-1,)
                 sample_weight = (sample_weight *
-                                 compute_sample_weight(self.class_weight, y))
+                                 compute_sample_weight(self.class_weight, 
+                                                       y.reshape(-1,)))
+                sample_weight = sample_weight.reshape(n_samples, n_days, n_firms)
 
             self.classes_, y = np.unique(y, return_inverse=True)
             n_trim_classes = np.count_nonzero(np.bincount(y, sample_weight))
@@ -402,10 +525,8 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                                  "trimmed classes with zero weights, while 2 "
                                  "classes are required."
                                  % n_trim_classes)
+            y = y.reshape(n_samples, n_days, n_firms).astype(float)
             self.n_classes_ = len(self.classes_)
-
-        else:
-            X, y = self._validate_data(X, y)
 
         hall_of_fame = self.hall_of_fame
         if hall_of_fame is None:
@@ -901,6 +1022,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
                  p_point_mutation=0.01,
                  p_point_replace=0.05,
                  max_samples=1.0,
+                 sample_days=None,
                  feature_names=None,
                  warm_start=False,
                  low_memory=False,
@@ -925,6 +1047,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
             p_point_mutation=p_point_mutation,
             p_point_replace=p_point_replace,
             max_samples=max_samples,
+            sample_days=sample_days,
             feature_names=feature_names,
             warm_start=warm_start,
             low_memory=low_memory,
@@ -938,26 +1061,41 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
             return self.__repr__()
         return self._program.__str__()
 
-    def predict(self, X):
+    def predict(self, X, transform=True, return_2d=False):
         """Perform regression on test vectors X.
 
         Parameters
         ----------
-        X : array-like, shape = [n_samples, n_features]
-            Input vectors, where n_samples is the number of samples
-            and n_features is the number of features.
+        X : List[pd.DataFrame] or array-like of shape (n_features,
+        n_days, n_firms) or (n_samples, n_features, n_days, n_firms)
+            Input vectors, where n_samples is the number of samples,
+            n_features is the number of features, n_days is sequence
+            length of each sample, n_firms is number of firms / stocks.
+            If provided as DataFrames, must have same index / columns, 
+            with shape (n_days, n_firms).
+
+        transform : bool, default=True
+            If set to True and have attribute self._transformer, will
+            use it to transform result.
+            
+        return_2d : bool, default=False
+            If set to True, will flatten n_samples dim and reshape to
+            (n_samples*n_days, n_firms) with padded rows removed. If X
+            is provided as DataFrames, also keep original index and
+            columns.
 
         Returns
         -------
-        y : array, shape = [n_samples]
-            Predicted values for X.
-
+        y : pd.DataFrame or array-like of shape (n_days, n_firms)
+        or (n_samples, n_days, n_firms)
+            Target values, shape depends on return_2d argument.
         """
         if not hasattr(self, '_program'):
             raise NotFittedError('SymbolicRegressor not fitted.')
 
-        X = check_array(X, allow_nd=True, force_all_finite='allow-nan')
-        _, n_features = X.shape[:2]
+        # X = check_array(X, allow_nd=True, force_all_finite='allow-nan')
+        X, _, _, ind, col = self._validate_data(X, None, None)
+        n_features = X.shape[1]
         if self.n_features_in_ != n_features:
             raise ValueError('Number of features of the model must match the '
                              'input. Model n_features is %s and input '
@@ -965,7 +1103,16 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
                              % (self.n_features_in_, n_features))
 
         y = self._program.execute(X)
-
+        if transform and getattr(self, '_transformer', None) is not None:
+            y = self._transformer(y)
+        if return_2d:
+            if isinstance(ind, int):
+                y = y[0]
+            elif isinstance(ind, pd.Index):
+                y = pd.DataFrame(y[0], index=ind, columns=col)
+            else:
+                raise ValueError(f'Unsurpported index type ' 
+                                 f'{type(ind)}, {type(col)}')
         return y
 
 
@@ -1234,385 +1381,431 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
         return {'binary_only': True}
 
     def predict_proba(self, X):
-        """Predict probabilities on test vectors X.
+        """Predict probabilities on vectors X. 
 
         Parameters
         ----------
-        X : array-like, shape = [n_samples, n_features]
-            Input vectors, where n_samples is the number of samples
-            and n_features is the number of features.
+        X : List[pd.DataFrame] or array-like of shape (n_features,
+        n_days, n_firms) or (n_samples, n_features, n_days, n_firms)
+            Input vectors, where n_samples is the number of samples,
+            n_features is the number of features, n_days is sequence
+            length of each sample, n_firms is number of firms / stocks.
+            If provided as DataFrames, must have same index / columns, 
+            with shape (n_days, n_firms).
 
         Returns
         -------
-        proba : array, shape = [n_samples, n_classes]
-            The class probabilities of the input samples. The order of the
-            classes corresponds to that in the attribute `classes_`.
+        y_prob : array-like of shape (n_samples, n_days, n_firms, n_classes)
+            Target values, shape depends on return_2d argument.
+        """
+        if not hasattr(self, '_program'):
+            raise NotFittedError('SymbolicClassifier not fitted.')
+
+        X, _, _, _, _ = self._validate_data(X, None, None)
+        n_features = X.shape[1]
+        if self.n_features_in_ != n_features:
+            raise ValueError('Number of features of the model must match the '
+                             'input. Model n_features is %s and input '
+                             'n_features is %s.'
+                             % (self.n_features_in_, n_features))
+
+        y = self._program.execute(X)
+        if getattr(self, '_transformer', None) is None:
+            warn('No transformer for result, use raw predict as-is.')
+        else:
+            y = self._transformer(y)
+        y = np.stack([1.-y, y], axis=-1)
+        return y
+
+    def predict(self, X, return_2d=False):
+        """Predict classes on test vectors X. If return_2d is set
+        to True, return predict result in 2d array or DataFrame.
+
+        Parameters
+        ----------
+        X : List[pd.DataFrame] or array-like of shape (n_features,
+        n_days, n_firms) or (n_samples, n_features, n_days, n_firms)
+            Input vectors, where n_samples is the number of samples,
+            n_features is the number of features, n_days is sequence
+            length of each sample, n_firms is number of firms / stocks.
+            If provided as DataFrames, must have same index / columns, 
+            with shape (n_days, n_firms).
+            
+        return_2d : bool, default=False
+            If set to True, will flatten n_samples dim and reshape to
+            (n_samples*n_days, n_firms) with padded rows removed. If X
+            is provided as DataFrames, also keep original index and
+            columns. Finally, only probability for positive class is
+            returned.
+
+        Returns
+        -------
+        y : pd.DataFrame or array-like of shape (n_days, n_firms)
+        or (n_samples, n_days, n_firms)
+            Target values, shape depends on return_2d argument.
 
         """
         if not hasattr(self, '_program'):
             raise NotFittedError('SymbolicClassifier not fitted.')
 
-        X = check_array(X, allow_nd=True, force_all_finite='allow-nan')
-        _, n_features = X.shape[:2]
+        X, _, _, ind, col = self._validate_data(X, None, None)
+        n_features = X.shape[1]
         if self.n_features_in_ != n_features:
             raise ValueError('Number of features of the model must match the '
                              'input. Model n_features is %s and input '
                              'n_features is %s.'
                              % (self.n_features_in_, n_features))
 
-        scores = self._program.execute(X)
-        proba = self._transformer(scores)
-        proba = np.vstack([1 - proba, proba]).T
-        return proba
-
-    def predict(self, X):
-        """Predict classes on test vectors X.
-
-        Parameters
-        ----------
-        X : array-like, shape = [n_samples, n_features]
-            Input vectors, where n_samples is the number of samples
-            and n_features is the number of features.
-
-        Returns
-        -------
-        y : array, shape = [n_samples,]
-            The predicted classes of the input samples.
-
-        """
-        proba = self.predict_proba(X)
-        return self.classes_.take(np.argmax(proba, axis=1), axis=0)
+        y = self._program.execute(X)
+        if getattr(self, '_transformer', None) is None:
+            raise ValueError('Cannot find transformer for raw predict.')
+        y = self._transformer(y)
+        mask = np.isfinite(y)
+        y = np.where(mask, y, 0.)
+        y = np.stack([1.-y, y], axis=-1)
+        y = self.classes_.take(np.argmax(y, axis=-1))
+        missing = np.str_(np.nan) \
+            if np.issubdtype(self.classes_.dtype, str) else np.nan
+        y = np.where(mask, y, missing)
+        if return_2d:
+            if isinstance(ind, int):
+                y = y[0]
+            elif isinstance(ind, pd.Index):
+                y = pd.DataFrame(y[0], index=ind, columns=col)
+            else:
+                raise ValueError(f'Unsurpported index type '
+                                   f'{type(ind)}, {type(col)}')
+        return y
 
 
-class SymbolicTransformer(BaseSymbolic, TransformerMixin):
+# class SymbolicTransformer(BaseSymbolic, TransformerMixin):
 
-    """A Genetic Programming symbolic transformer.
+#     """A Genetic Programming symbolic transformer.
 
-    A symbolic transformer is a supervised transformer that begins by building
-    a population of naive random formulas to represent a relationship. The
-    formulas are represented as tree-like structures with mathematical
-    functions being recursively applied to variables and constants. Each
-    successive generation of programs is then evolved from the one that came
-    before it by selecting the fittest individuals from the population to
-    undergo genetic operations such as crossover, mutation or reproduction.
-    The final population is searched for the fittest individuals with the least
-    correlation to one another.
+#     A symbolic transformer is a supervised transformer that begins by building
+#     a population of naive random formulas to represent a relationship. The
+#     formulas are represented as tree-like structures with mathematical
+#     functions being recursively applied to variables and constants. Each
+#     successive generation of programs is then evolved from the one that came
+#     before it by selecting the fittest individuals from the population to
+#     undergo genetic operations such as crossover, mutation or reproduction.
+#     The final population is searched for the fittest individuals with the least
+#     correlation to one another.
 
-    Parameters
-    ----------
-    population_size : integer, optional (default=1000)
-        The number of programs in each generation.
+#     Parameters
+#     ----------
+#     population_size : integer, optional (default=1000)
+#         The number of programs in each generation.
 
-    hall_of_fame : integer, or None, optional (default=100)
-        The number of fittest programs to compare from when finding the
-        least-correlated individuals for the n_components. If `None`, the
-        entire final generation will be used.
+#     hall_of_fame : integer, or None, optional (default=100)
+#         The number of fittest programs to compare from when finding the
+#         least-correlated individuals for the n_components. If `None`, the
+#         entire final generation will be used.
 
-    n_components : integer, or None, optional (default=10)
-        The number of best programs to return after searching the hall_of_fame
-        for the least-correlated individuals. If `None`, the entire
-        hall_of_fame will be used.
+#     n_components : integer, or None, optional (default=10)
+#         The number of best programs to return after searching the hall_of_fame
+#         for the least-correlated individuals. If `None`, the entire
+#         hall_of_fame will be used.
 
-    generations : integer, optional (default=20)
-        The number of generations to evolve.
+#     generations : integer, optional (default=20)
+#         The number of generations to evolve.
 
-    tournament_size : integer, optional (default=20)
-        The number of programs that will compete to become part of the next
-        generation.
+#     tournament_size : integer, optional (default=20)
+#         The number of programs that will compete to become part of the next
+#         generation.
 
-    stopping_criteria : float, optional (default=1.0)
-        The required metric value required in order to stop evolution early.
+#     stopping_criteria : float, optional (default=1.0)
+#         The required metric value required in order to stop evolution early.
 
-    const_range : tuple of two floats, or None, optional (default=(-1., 1.))
-        The range of constants to include in the formulas. If None then no
-        constants will be included in the candidate programs.
+#     const_range : tuple of two floats, or None, optional (default=(-1., 1.))
+#         The range of constants to include in the formulas. If None then no
+#         constants will be included in the candidate programs.
 
-    init_depth : tuple of two ints, optional (default=(2, 6))
-        The range of tree depths for the initial population of naive formulas.
-        Individual trees will randomly choose a maximum depth from this range.
-        When combined with `init_method='half and half'` this yields the well-
-        known 'ramped half and half' initialization method.
+#     init_depth : tuple of two ints, optional (default=(2, 6))
+#         The range of tree depths for the initial population of naive formulas.
+#         Individual trees will randomly choose a maximum depth from this range.
+#         When combined with `init_method='half and half'` this yields the well-
+#         known 'ramped half and half' initialization method.
 
-    init_method : str, optional (default='half and half')
-        - 'grow' : Nodes are chosen at random from both functions and
-          terminals, allowing for smaller trees than `init_depth` allows. Tends
-          to grow asymmetrical trees.
-        - 'full' : Functions are chosen until the `init_depth` is reached, and
-          then terminals are selected. Tends to grow 'bushy' trees.
-        - 'half and half' : Trees are grown through a 50/50 mix of 'full' and
-          'grow', making for a mix of tree shapes in the initial population.
+#     init_method : str, optional (default='half and half')
+#         - 'grow' : Nodes are chosen at random from both functions and
+#           terminals, allowing for smaller trees than `init_depth` allows. Tends
+#           to grow asymmetrical trees.
+#         - 'full' : Functions are chosen until the `init_depth` is reached, and
+#           then terminals are selected. Tends to grow 'bushy' trees.
+#         - 'half and half' : Trees are grown through a 50/50 mix of 'full' and
+#           'grow', making for a mix of tree shapes in the initial population.
 
-    function_set : iterable, optional (default=('add', 'sub', 'mul', 'div'))
-        The functions to use when building and evolving programs. This iterable
-        can include strings to indicate either individual functions as outlined
-        below, or you can also include your own functions as built using the
-        ``make_function`` factory from the ``functions`` module.
+#     function_set : iterable, optional (default=('add', 'sub', 'mul', 'div'))
+#         The functions to use when building and evolving programs. This iterable
+#         can include strings to indicate either individual functions as outlined
+#         below, or you can also include your own functions as built using the
+#         ``make_function`` factory from the ``functions`` module.
 
-        Available individual functions are:
+#         Available individual functions are:
 
-        - 'add' : addition, arity=2.
-        - 'sub' : subtraction, arity=2.
-        - 'mul' : multiplication, arity=2.
-        - 'div' : protected division where a denominator near-zero returns 1.,
-          arity=2.
-        - 'sqrt' : protected square root where the absolute value of the
-          argument is used, arity=1.
-        - 'log' : protected log where the absolute value of the argument is
-          used and a near-zero argument returns 0., arity=1.
-        - 'abs' : absolute value, arity=1.
-        - 'neg' : negative, arity=1.
-        - 'inv' : protected inverse where a near-zero argument returns 0.,
-          arity=1.
-        - 'max' : maximum, arity=2.
-        - 'min' : minimum, arity=2.
-        - 'sin' : sine (radians), arity=1.
-        - 'cos' : cosine (radians), arity=1.
-        - 'tan' : tangent (radians), arity=1.
+#         - 'add' : addition, arity=2.
+#         - 'sub' : subtraction, arity=2.
+#         - 'mul' : multiplication, arity=2.
+#         - 'div' : protected division where a denominator near-zero returns 1.,
+#           arity=2.
+#         - 'sqrt' : protected square root where the absolute value of the
+#           argument is used, arity=1.
+#         - 'log' : protected log where the absolute value of the argument is
+#           used and a near-zero argument returns 0., arity=1.
+#         - 'abs' : absolute value, arity=1.
+#         - 'neg' : negative, arity=1.
+#         - 'inv' : protected inverse where a near-zero argument returns 0.,
+#           arity=1.
+#         - 'max' : maximum, arity=2.
+#         - 'min' : minimum, arity=2.
+#         - 'sin' : sine (radians), arity=1.
+#         - 'cos' : cosine (radians), arity=1.
+#         - 'tan' : tangent (radians), arity=1.
 
-    metric : str, optional (default='pearson')
-        The name of the raw fitness metric. Available options include:
+#     metric : str, optional (default='pearson')
+#         The name of the raw fitness metric. Available options include:
 
-        - 'pearson', for Pearson's product-moment correlation coefficient.
-        - 'spearman' for Spearman's rank-order correlation coefficient.
+#         - 'pearson', for Pearson's product-moment correlation coefficient.
+#         - 'spearman' for Spearman's rank-order correlation coefficient.
 
-    parsimony_coefficient : float or "auto", optional (default=0.001)
-        This constant penalizes large programs by adjusting their fitness to
-        be less favorable for selection. Larger values penalize the program
-        more which can control the phenomenon known as 'bloat'. Bloat is when
-        evolution is increasing the size of programs without a significant
-        increase in fitness, which is costly for computation time and makes for
-        a less understandable final result. This parameter may need to be tuned
-        over successive runs.
+#     parsimony_coefficient : float or "auto", optional (default=0.001)
+#         This constant penalizes large programs by adjusting their fitness to
+#         be less favorable for selection. Larger values penalize the program
+#         more which can control the phenomenon known as 'bloat'. Bloat is when
+#         evolution is increasing the size of programs without a significant
+#         increase in fitness, which is costly for computation time and makes for
+#         a less understandable final result. This parameter may need to be tuned
+#         over successive runs.
 
-        If "auto" the parsimony coefficient is recalculated for each generation
-        using c = Cov(l,f)/Var( l), where Cov(l,f) is the covariance between
-        program size l and program fitness f in the population, and Var(l) is
-        the variance of program sizes.
+#         If "auto" the parsimony coefficient is recalculated for each generation
+#         using c = Cov(l,f)/Var( l), where Cov(l,f) is the covariance between
+#         program size l and program fitness f in the population, and Var(l) is
+#         the variance of program sizes.
 
-    p_crossover : float, optional (default=0.9)
-        The probability of performing crossover on a tournament winner.
-        Crossover takes the winner of a tournament and selects a random subtree
-        from it to be replaced. A second tournament is performed to find a
-        donor. The donor also has a subtree selected at random and this is
-        inserted into the original parent to form an offspring in the next
-        generation.
+#     p_crossover : float, optional (default=0.9)
+#         The probability of performing crossover on a tournament winner.
+#         Crossover takes the winner of a tournament and selects a random subtree
+#         from it to be replaced. A second tournament is performed to find a
+#         donor. The donor also has a subtree selected at random and this is
+#         inserted into the original parent to form an offspring in the next
+#         generation.
 
-    p_subtree_mutation : float, optional (default=0.01)
-        The probability of performing subtree mutation on a tournament winner.
-        Subtree mutation takes the winner of a tournament and selects a random
-        subtree from it to be replaced. A donor subtree is generated at random
-        and this is inserted into the original parent to form an offspring in
-        the next generation.
+#     p_subtree_mutation : float, optional (default=0.01)
+#         The probability of performing subtree mutation on a tournament winner.
+#         Subtree mutation takes the winner of a tournament and selects a random
+#         subtree from it to be replaced. A donor subtree is generated at random
+#         and this is inserted into the original parent to form an offspring in
+#         the next generation.
 
-    p_hoist_mutation : float, optional (default=0.01)
-        The probability of performing hoist mutation on a tournament winner.
-        Hoist mutation takes the winner of a tournament and selects a random
-        subtree from it. A random subtree of that subtree is then selected
-        and this is 'hoisted' into the original subtrees location to form an
-        offspring in the next generation. This method helps to control bloat.
+#     p_hoist_mutation : float, optional (default=0.01)
+#         The probability of performing hoist mutation on a tournament winner.
+#         Hoist mutation takes the winner of a tournament and selects a random
+#         subtree from it. A random subtree of that subtree is then selected
+#         and this is 'hoisted' into the original subtrees location to form an
+#         offspring in the next generation. This method helps to control bloat.
 
-    p_point_mutation : float, optional (default=0.01)
-        The probability of performing point mutation on a tournament winner.
-        Point mutation takes the winner of a tournament and selects random
-        nodes from it to be replaced. Terminals are replaced by other terminals
-        and functions are replaced by other functions that require the same
-        number of arguments as the original node. The resulting tree forms an
-        offspring in the next generation.
+#     p_point_mutation : float, optional (default=0.01)
+#         The probability of performing point mutation on a tournament winner.
+#         Point mutation takes the winner of a tournament and selects random
+#         nodes from it to be replaced. Terminals are replaced by other terminals
+#         and functions are replaced by other functions that require the same
+#         number of arguments as the original node. The resulting tree forms an
+#         offspring in the next generation.
 
-        Note : The above genetic operation probabilities must sum to less than
-        one. The balance of probability is assigned to 'reproduction', where a
-        tournament winner is cloned and enters the next generation unmodified.
+#         Note : The above genetic operation probabilities must sum to less than
+#         one. The balance of probability is assigned to 'reproduction', where a
+#         tournament winner is cloned and enters the next generation unmodified.
 
-    p_point_replace : float, optional (default=0.05)
-        For point mutation only, the probability that any given node will be
-        mutated.
+#     p_point_replace : float, optional (default=0.05)
+#         For point mutation only, the probability that any given node will be
+#         mutated.
 
-    max_samples : float, optional (default=1.0)
-        The fraction of samples to draw from X to evaluate each program on.
+#     max_samples : float, optional (default=1.0)
+#         The fraction of samples to draw from X to evaluate each program on.
 
-    feature_names : list, optional (default=None)
-        Optional list of feature names, used purely for representations in
-        the `print` operation or `export_graphviz`. If None, then X0, X1, etc
-        will be used for representations.
+#     feature_names : list, optional (default=None)
+#         Optional list of feature names, used purely for representations in
+#         the `print` operation or `export_graphviz`. If None, then X0, X1, etc
+#         will be used for representations.
 
-    warm_start : bool, optional (default=False)
-        When set to ``True``, reuse the solution of the previous call to fit
-        and add more generations to the evolution, otherwise, just fit a new
-        evolution.
+#     warm_start : bool, optional (default=False)
+#         When set to ``True``, reuse the solution of the previous call to fit
+#         and add more generations to the evolution, otherwise, just fit a new
+#         evolution.
 
-    low_memory : bool, optional (default=False)
-        When set to ``True``, only the current generation is retained. Parent
-        information is discarded. For very large populations or runs with many
-        generations, this can result in substantial memory use reduction.
+#     low_memory : bool, optional (default=False)
+#         When set to ``True``, only the current generation is retained. Parent
+#         information is discarded. For very large populations or runs with many
+#         generations, this can result in substantial memory use reduction.
 
-    n_jobs : integer, optional (default=1)
-        The number of jobs to run in parallel for `fit`. If -1, then the number
-        of jobs is set to the number of cores.
+#     n_jobs : integer, optional (default=1)
+#         The number of jobs to run in parallel for `fit`. If -1, then the number
+#         of jobs is set to the number of cores.
 
-    verbose : int, optional (default=0)
-        Controls the verbosity of the evolution building process.
+#     verbose : int, optional (default=0)
+#         Controls the verbosity of the evolution building process.
 
-    random_state : int, RandomState instance or None, optional (default=None)
-        If int, random_state is the seed used by the random number generator;
-        If RandomState instance, random_state is the random number generator;
-        If None, the random number generator is the RandomState instance used
-        by `np.random`.
+#     random_state : int, RandomState instance or None, optional (default=None)
+#         If int, random_state is the seed used by the random number generator;
+#         If RandomState instance, random_state is the random number generator;
+#         If None, the random number generator is the RandomState instance used
+#         by `np.random`.
 
-    Attributes
-    ----------
-    run_details_ : dict
-        Details of the evolution process. Includes the following elements:
+#     Attributes
+#     ----------
+#     run_details_ : dict
+#         Details of the evolution process. Includes the following elements:
 
-        - 'generation' : The generation index.
-        - 'average_length' : The average program length of the generation.
-        - 'average_fitness' : The average program fitness of the generation.
-        - 'best_length' : The length of the best program in the generation.
-        - 'best_fitness' : The fitness of the best program in the generation.
-        - 'best_oob_fitness' : The out of bag fitness of the best program in
-          the generation (requires `max_samples` < 1.0).
-        - 'generation_time' : The time it took for the generation to evolve.
+#         - 'generation' : The generation index.
+#         - 'average_length' : The average program length of the generation.
+#         - 'average_fitness' : The average program fitness of the generation.
+#         - 'best_length' : The length of the best program in the generation.
+#         - 'best_fitness' : The fitness of the best program in the generation.
+#         - 'best_oob_fitness' : The out of bag fitness of the best program in
+#           the generation (requires `max_samples` < 1.0).
+#         - 'generation_time' : The time it took for the generation to evolve.
 
-    See Also
-    --------
-    SymbolicRegressor
+#     See Also
+#     --------
+#     SymbolicRegressor
 
-    References
-    ----------
-    .. [1] J. Koza, "Genetic Programming", 1992.
+#     References
+#     ----------
+#     .. [1] J. Koza, "Genetic Programming", 1992.
 
-    .. [2] R. Poli, et al. "A Field Guide to Genetic Programming", 2008.
+#     .. [2] R. Poli, et al. "A Field Guide to Genetic Programming", 2008.
 
-    """
+#     """
 
-    def __init__(self,
-                 *,
-                 population_size=1000,
-                 hall_of_fame=100,
-                 n_components=10,
-                 generations=20,
-                 tournament_size=20,
-                 stopping_criteria=1.0,
-                 const_range=(-1., 1.),
-                 init_depth=(2, 6),
-                 init_method='half and half',
-                 function_set=('add', 'sub', 'mul', 'div'),
-                 metric='pearson',
-                 parsimony_coefficient=0.001,
-                 p_crossover=0.9,
-                 p_subtree_mutation=0.01,
-                 p_hoist_mutation=0.01,
-                 p_point_mutation=0.01,
-                 p_point_replace=0.05,
-                 max_samples=1.0,
-                 feature_names=None,
-                 warm_start=False,
-                 low_memory=False,
-                 n_jobs=1,
-                 verbose=0,
-                 random_state=None):
-        super(SymbolicTransformer, self).__init__(
-            population_size=population_size,
-            hall_of_fame=hall_of_fame,
-            n_components=n_components,
-            generations=generations,
-            tournament_size=tournament_size,
-            stopping_criteria=stopping_criteria,
-            const_range=const_range,
-            init_depth=init_depth,
-            init_method=init_method,
-            function_set=function_set,
-            metric=metric,
-            parsimony_coefficient=parsimony_coefficient,
-            p_crossover=p_crossover,
-            p_subtree_mutation=p_subtree_mutation,
-            p_hoist_mutation=p_hoist_mutation,
-            p_point_mutation=p_point_mutation,
-            p_point_replace=p_point_replace,
-            max_samples=max_samples,
-            feature_names=feature_names,
-            warm_start=warm_start,
-            low_memory=low_memory,
-            n_jobs=n_jobs,
-            verbose=verbose,
-            random_state=random_state)
+#     def __init__(self,
+#                  *,
+#                  population_size=1000,
+#                  hall_of_fame=100,
+#                  n_components=10,
+#                  generations=20,
+#                  tournament_size=20,
+#                  stopping_criteria=1.0,
+#                  const_range=(-1., 1.),
+#                  init_depth=(2, 6),
+#                  init_method='half and half',
+#                  function_set=('add', 'sub', 'mul', 'div'),
+#                  metric='pearson',
+#                  parsimony_coefficient=0.001,
+#                  p_crossover=0.9,
+#                  p_subtree_mutation=0.01,
+#                  p_hoist_mutation=0.01,
+#                  p_point_mutation=0.01,
+#                  p_point_replace=0.05,
+#                  max_samples=1.0,
+#                  feature_names=None,
+#                  warm_start=False,
+#                  low_memory=False,
+#                  n_jobs=1,
+#                  verbose=0,
+#                  random_state=None):
+#         super(SymbolicTransformer, self).__init__(
+#             population_size=population_size,
+#             hall_of_fame=hall_of_fame,
+#             n_components=n_components,
+#             generations=generations,
+#             tournament_size=tournament_size,
+#             stopping_criteria=stopping_criteria,
+#             const_range=const_range,
+#             init_depth=init_depth,
+#             init_method=init_method,
+#             function_set=function_set,
+#             metric=metric,
+#             parsimony_coefficient=parsimony_coefficient,
+#             p_crossover=p_crossover,
+#             p_subtree_mutation=p_subtree_mutation,
+#             p_hoist_mutation=p_hoist_mutation,
+#             p_point_mutation=p_point_mutation,
+#             p_point_replace=p_point_replace,
+#             max_samples=max_samples,
+#             feature_names=feature_names,
+#             warm_start=warm_start,
+#             low_memory=low_memory,
+#             n_jobs=n_jobs,
+#             verbose=verbose,
+#             random_state=random_state)
 
-    def __len__(self):
-        """Overloads `len` output to be the number of fitted components."""
-        if not hasattr(self, '_best_programs'):
-            return 0
-        return self.n_components
+#     def __len__(self):
+#         """Overloads `len` output to be the number of fitted components."""
+#         if not hasattr(self, '_best_programs'):
+#             return 0
+#         return self.n_components
 
-    def __getitem__(self, item):
-        """Return the ith item of the fitted components."""
-        if item >= len(self):
-            raise IndexError
-        return self._best_programs[item]
+#     def __getitem__(self, item):
+#         """Return the ith item of the fitted components."""
+#         if item >= len(self):
+#             raise IndexError
+#         return self._best_programs[item]
 
-    def __str__(self):
-        """Overloads `print` output of the object to resemble LISP trees."""
-        if not hasattr(self, '_best_programs'):
-            return self.__repr__()
-        output = str([gp.__str__() for gp in self])
-        return output.replace("',", ",\n").replace("'", "")
+#     def __str__(self):
+#         """Overloads `print` output of the object to resemble LISP trees."""
+#         if not hasattr(self, '_best_programs'):
+#             return self.__repr__()
+#         output = str([gp.__str__() for gp in self])
+#         return output.replace("',", ",\n").replace("'", "")
 
-    def _more_tags(self):
-        return {
-            "_xfail_checks": {
-                "check_sample_weights_invariance": (
-                    "zero sample_weight is not equivalent to removing samples"
-                ),
-            }
-        }
+#     def _more_tags(self):
+#         return {
+#             "_xfail_checks": {
+#                 "check_sample_weights_invariance": (
+#                     "zero sample_weight is not equivalent to removing samples"
+#                 ),
+#             }
+#         }
 
-    def transform(self, X):
-        """Transform X according to the fitted transformer.
+#     def transform(self, X):
+#         """Transform X according to the fitted transformer.
 
-        Parameters
-        ----------
-        X : array-like, shape = [n_samples, n_features]
-            Input vectors, where n_samples is the number of samples
-            and n_features is the number of features.
+#         Parameters
+#         ----------
+#         X : array-like, shape = [n_samples, n_features]
+#             Input vectors, where n_samples is the number of samples
+#             and n_features is the number of features.
 
-        Returns
-        -------
-        X_new : array-like, shape = [n_samples, n_components]
-            Transformed array.
+#         Returns
+#         -------
+#         X_new : array-like, shape = [n_samples, n_components]
+#             Transformed array.
 
-        """
-        if not hasattr(self, '_best_programs'):
-            raise NotFittedError('SymbolicTransformer not fitted.')
+#         """
+#         if not hasattr(self, '_best_programs'):
+#             raise NotFittedError('SymbolicTransformer not fitted.')
+#         X = check_array(X, allow_nd=True, force_all_finite='allow-nan')
+#         _, n_features = X.shape[:2]
+#         if self.n_features_in_ != n_features:
+#             raise ValueError('Number of features of the model must match the '
+#                              'input. Model n_features is %s and input '
+#                              'n_features is %s.'
+#                              % (self.n_features_in_, n_features))
 
-        X = check_array(X, allow_nd=True, force_all_finite='allow-nan')
-        _, n_features = X.shape[:2]
-        if self.n_features_in_ != n_features:
-            raise ValueError('Number of features of the model must match the '
-                             'input. Model n_features is %s and input '
-                             'n_features is %s.'
-                             % (self.n_features_in_, n_features))
+#         X_new = np.array([gp.execute(X) for gp in self._best_programs]).T
 
-        X_new = np.array([gp.execute(X) for gp in self._best_programs]).T
+#         return X_new
 
-        return X_new
+#     def fit_transform(self, X, y, sample_weight=None):
+#         """Fit to data, then transform it.
 
-    def fit_transform(self, X, y, sample_weight=None):
-        """Fit to data, then transform it.
+#         Parameters
+#         ----------
+#         X : array-like, shape = [n_samples, n_features]
+#             Training vectors, where n_samples is the number of samples and
+#             n_features is the number of features.
 
-        Parameters
-        ----------
-        X : array-like, shape = [n_samples, n_features]
-            Training vectors, where n_samples is the number of samples and
-            n_features is the number of features.
+#         y : array-like, shape = [n_samples]
+#             Target values.
 
-        y : array-like, shape = [n_samples]
-            Target values.
+#         sample_weight : array-like, shape = [n_samples], optional
+#             Weights applied to individual samples.
 
-        sample_weight : array-like, shape = [n_samples], optional
-            Weights applied to individual samples.
+#         Returns
+#         -------
+#         X_new : array-like, shape = [n_samples, n_components]
+#             Transformed array.
 
-        Returns
-        -------
-        X_new : array-like, shape = [n_samples, n_components]
-            Transformed array.
-
-        """
-        return self.fit(X, y, sample_weight).transform(X)
+#         """
+#         return self.fit(X, y, sample_weight).transform(X)
