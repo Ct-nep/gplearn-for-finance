@@ -10,6 +10,7 @@ computer program. It is used for creating and evolving programs used in the
 # License: BSD 3 clause
 
 from copy import copy
+from typing import *
 
 import numpy as np
 from sklearn.utils.random import sample_without_replacement
@@ -442,35 +443,41 @@ class _Program(object):
         """Get the indices used to measure the program's fitness."""
         return self.get_all_indices()[0]
 
-    def raw_fitness(self, X, y, sample_weight):
+    def raw_fitness(
+        self, 
+        X: np.ndarray, 
+        y: np.ndarray, 
+        sample_weight: np.ndarray, 
+        additional_data: Dict[str, np.ndarray],
+    ) -> float:
         """Evaluate the raw fitness of the program according to X, y.
 
         Parameters
         ----------
-        X : {array-like}, shape = [n_samples, n_features]
-            Training vectors, where n_samples is the number of samples and
-            n_features is the number of features.
+        X : array-like, shape = (n_days, n_features, n_firms)
+            Training vectors, where n_days is the number of sample days
+            and n_features is the number of features.
 
-        y : array-like, shape = [n_samples]
-            Target values.
+        y : array-like, shape = (n_days, n_firms)
+            Target values, e.g. DELAY0 returns for DELAYED features.
 
-        sample_weight : array-like, shape = [n_samples]
+        sample_weight : array-like, shape = (n_days, n_firms)
             Weights applied to individual samples.
+            
+        additional_data : dict of array-like
+            Additional information received from fit() call, can be
+            universe and industry classification etc. to help repair and
+            validate weights. Require a customized transform function to
+            tell how it works when creating GP instance.
 
         Returns
         -------
         raw_fitness : float
             The raw fitness of the program.
-
         """
         y_pred = self.execute(X)
-        if self.transformer:
-            y_pred = self.transformer(y_pred)
-        # if y_pred.shape != y.shape:
-        #     import pickle
-        #     print(X.shape, y.shape, y_pred.shape, sample_weight.shape)
-        #     with open('/home/thchu/notebook/dump.pkl', 'wb') as f:
-        #         pickle.dump(self, f)
+        if self.transformer is not None:
+            y_pred = self.transformer(y_pred, additional_data)
         raw_fitness = self.metric(y, y_pred, sample_weight)
         return raw_fitness
 

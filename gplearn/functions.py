@@ -306,7 +306,7 @@ def make_function(*, function, name, arity, wrap=True):
 def _protected_division(x1, x2):
     """Closure of division (x1/x2) for zero denominator."""
     with np.errstate(divide='ignore', invalid='ignore'):
-        return np.where(np.abs(x2) > 0.001, np.divide(x1, x2), 1.)
+        return np.where(np.abs(x2) > 1e-15, np.divide(x1, x2), 1.)
 
 
 def _protected_sqrt(x1):
