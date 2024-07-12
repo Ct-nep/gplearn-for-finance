@@ -15,7 +15,7 @@ from typing import *
 import numpy as np
 from sklearn.utils.random import sample_without_replacement
 
-from .functions import _Function
+from .functions import _Function, _TSFunction
 from .utils import check_random_state
 
 
@@ -130,6 +130,7 @@ class _Program(object):
                  const_range,
                  metric,
                  p_point_replace,
+                 p_grow_terminal,
                  parsimony_coefficient,
                  random_state,
                  transformer=None,
@@ -144,6 +145,7 @@ class _Program(object):
         self.const_range = const_range
         self.metric = metric
         self.p_point_replace = p_point_replace
+        self.p_grow_terminal = p_grow_terminal
         self.parsimony_coefficient = parsimony_coefficient
         self.transformer = transformer
         self.feature_names = feature_names
@@ -186,19 +188,25 @@ class _Program(object):
         # Start a program with a function to avoid degenerative programs
         function = random_state.randint(len(self.function_set))
         function = self.function_set[function]
-        program = [function]
+        param = random_state.randint(len(function.valid_range))
+        param = function.valid_range[param]
+        program = [(function, param)]
         terminal_stack = [function.arity]
 
         while terminal_stack:
             depth = len(terminal_stack)
-            choice = self.n_features + len(self.function_set)
-            choice = random_state.randint(choice)
+            # choice = self.n_features + len(self.function_set)
+            # choice = random_state.randint(choice)
+            choice = random_state.rand()
             # Determine if we are adding a function or terminal
             if (depth < max_depth) and (method == 'full' or
-                                        choice <= len(self.function_set)):
+                                        choice > self.p_grow_terminal):
+                                        # choice <= len(self.function_set)):
                 function = random_state.randint(len(self.function_set))
                 function = self.function_set[function]
-                program.append(function)
+                param = random_state.randint(len(function.valid_range))
+                param = function.valid_range[param]
+                program.append((function, param))
                 terminal_stack.append(function.arity)
             else:
                 # We need a terminal, add a variable or constant
@@ -212,7 +220,7 @@ class _Program(object):
                         # We should never get here
                         raise ValueError('A constant was produced with '
                                          'const_range=None.')
-                program.append(terminal)
+                program.append((terminal, None))
                 terminal_stack[-1] -= 1
                 while terminal_stack[-1] == 0:
                     terminal_stack.pop()
@@ -226,7 +234,7 @@ class _Program(object):
     def validate_program(self):
         """Rough check that the embedded program in the object is valid."""
         terminals = [0]
-        for node in self.program:
+        for node, param in self.program:
             if isinstance(node, _Function):
                 terminals.append(node.arity)
             else:
@@ -240,10 +248,12 @@ class _Program(object):
         """Overloads `print` output of the object to resemble a LISP tree."""
         terminals = [0]
         output = ''
-        for i, node in enumerate(self.program):
+        for i, (node, param) in enumerate(self.program):
             if isinstance(node, _Function):
                 terminals.append(node.arity)
                 output += node.name + '('
+                if param is not None:
+                    output += f'{param}, '
             else:
                 if isinstance(node, int):
                     if self.feature_names is None:
@@ -280,14 +290,17 @@ class _Program(object):
         if fade_nodes is None:
             fade_nodes = []
         output = 'digraph program {\nnode [style=filled]\n'
-        for i, node in enumerate(self.program):
+        for i, (node, param) in enumerate(self.program):
             fill = '#cecece'
             if isinstance(node, _Function):
                 if i not in fade_nodes:
                     fill = '#136ed4'
                 terminals.append([node.arity, i])
+                name = node.name
+                if param is not None:
+                    name += str(param)
                 output += ('%d [label="%s", fillcolor="%s"] ;\n'
-                           % (i, node.name, fill))
+                           % (i, name, fill))
             else:
                 if i not in fade_nodes:
                     fill = '#60a6f6'
@@ -325,7 +338,7 @@ class _Program(object):
         """Calculates the maximum depth of the program tree."""
         terminals = [0]
         depth = 1
-        for node in self.program:
+        for node, param in self.program:
             if isinstance(node, _Function):
                 terminals.append(node.arity)
                 depth = max(len(terminals), depth)
@@ -345,47 +358,47 @@ class _Program(object):
 
         Parameters
         ----------
-        X : {array-like}, shape = [n_samples, n_features]
-            Training vectors, where n_samples is the number of samples and
+        X : array-like, shape = (n_days, n_features, n_firms)
+            Training vectors, where n_days is the number of samples and
             n_features is the number of features.
 
         Returns
         -------
-        y_hats : array-like, shape = [n_samples]
+        y_hats : array-like, shape = (n_days, n_firms)
             The result of executing the program on X.
 
         """
         # Check for single-node programs
-        node = self.program[0]
+        node, param = self.program[0]
         if isinstance(node, float):
             # return np.repeat(node, X.shape[0])
             return np.full_like(X[:, 0], node, dtype=float)
         if isinstance(node, int):
             return X[:, node]
-
+        # List[List[Tuple(Callable, Union[int, Tuple])]]
         apply_stack = []
 
-        for node in self.program:
-
+        for node, param in self.program:
             if isinstance(node, _Function):
-                apply_stack.append([node])
+                apply_stack.append([(node, param)])
             else:
                 # Lazily evaluate later
-                apply_stack[-1].append(node)
+                apply_stack[-1].append((node, param))
 
-            while len(apply_stack[-1]) == apply_stack[-1][0].arity + 1:
+            while len(apply_stack[-1]) == apply_stack[-1][0][0].arity + 1:
                 # Apply functions that have sufficient arguments
-                function = apply_stack[-1][0]
+                function, param = apply_stack[-1][0]
                 # terminals = [np.repeat(t, X.shape[0]) if isinstance(t, float)
                 #              else X[:, t] if isinstance(t, int)
                 #              else t for t in apply_stack[-1][1:]]
-                terminals = [np.full_like(X[:, 0], t, dtype=float) if isinstance(t, float)
-                             else X[:, t] if isinstance(t, int)
-                             else t for t in apply_stack[-1][1:]]
-                intermediate_result = function(*terminals)
+                terminals = [np.full_like(X[:, 0], t, dtype=float) \
+                    if isinstance(t, float) \
+                    else X[:, t] if isinstance(t, int) \
+                    else t[0] for t in apply_stack[-1][1:]]
+                intermediate_result = function(param, *terminals)
                 if len(apply_stack) != 1:
                     apply_stack.pop()
-                    apply_stack[-1].append(intermediate_result)
+                    apply_stack[-1].append((intermediate_result, None))
                 else:
                     return intermediate_result
 
@@ -449,7 +462,8 @@ class _Program(object):
         y: np.ndarray, 
         sample_weight: np.ndarray, 
         additional_data: Dict[str, np.ndarray],
-    ) -> float:
+        return_pnl=False,
+    ) -> Union[float, Tuple]:
         """Evaluate the raw fitness of the program according to X, y.
 
         Parameters
@@ -469,6 +483,11 @@ class _Program(object):
             universe and industry classification etc. to help repair and
             validate weights. Require a customized transform function to
             tell how it works when creating GP instance.
+            
+        return_pnl : optional, bool, default=False
+            If set to True, function will return a 2-element-tuple
+            (fitness, pnl), where pnl is daily portfolio return at each
+            sample day in shape (n_days,).
 
         Returns
         -------
@@ -479,6 +498,8 @@ class _Program(object):
         if self.transformer is not None:
             y_pred = self.transformer(y_pred, additional_data)
         raw_fitness = self.metric(y, y_pred, sample_weight)
+        if return_pnl:
+            return raw_fitness, np.nansum(y_pred*y, axis=1)
         return raw_fitness
 
     def fitness(self, parsimony_coefficient=None):
@@ -524,14 +545,14 @@ class _Program(object):
         # Choice of crossover points follows Koza's (1992) widely used approach
         # of choosing functions 90% of the time and leaves 10% of the time.
         probs = np.array([0.9 if isinstance(node, _Function) else 0.1
-                          for node in program])
+                          for node, param in program])
         probs = np.cumsum(probs / probs.sum())
         start = np.searchsorted(probs, random_state.uniform())
 
         stack = 1
         end = start
         while stack > end - start:
-            node = program[end]
+            node, param = program[end]
             if isinstance(node, _Function):
                 stack += node.arity
             end += 1
@@ -632,12 +653,16 @@ class _Program(object):
         return self.program[:start] + hoist + self.program[end:], removed
 
     def point_mutation(self, random_state):
-        """Perform the point mutation operation on the program.
+        """Perform point mutation operation on the program. Half of
+        time, mutation only applies to parameters (if any) instead of
+        function itself. So user may want to increase muation
+        probability.
 
-        Point mutation selects random nodes from the embedded program to be
-        replaced. Terminals are replaced by other terminals and functions are
-        replaced by other functions that require the same number of arguments
-        as the original node. The resulting tree forms an offspring.
+        Point mutation selects random nodes from the embedded program to
+        be replaced. Terminals are replaced by other terminals and
+        functions are replaced by other functions / parameters that
+        require the same number of arguments as the original node. The
+        resulting tree forms an offspring.
 
         Parameters
         ----------
@@ -655,28 +680,33 @@ class _Program(object):
         # Get the nodes to modify
         mutate = np.where(random_state.uniform(size=len(program)) <
                           self.p_point_replace)[0]
+        # Half of time we only mutate param within valid range
+        mutate_fn = random_state.randint(2, size=mutate.shape)
 
-        for node in mutate:
-            if isinstance(program[node], _Function):
-                arity = program[node].arity
-                # Find a valid replacement with same arity
-                replacement = len(self.arities[arity])
-                replacement = random_state.randint(replacement)
-                replacement = self.arities[arity][replacement]
-                program[node] = replacement
+        for n, node in enumerate(mutate):
+            fn, param = program[node]
+            if isinstance(fn, _Function):
+                if mutate_fn[n]:
+                    arity = fn.arity
+                    # Find a valid replacement with same arity
+                    fn = len(self.arities[arity])
+                    fn = random_state.randint(fn)
+                    fn = self.arities[arity][fn]
+                param = random_state.randint(len(fn.valid_range))
+                param = fn.valid_range[param] 
             else:
                 # We've got a terminal, add a const or variable
                 if self.const_range is not None:
-                    terminal = random_state.randint(self.n_features + 1)
+                    fn = random_state.randint(self.n_features + 1)
                 else:
-                    terminal = random_state.randint(self.n_features)
-                if terminal == self.n_features:
-                    terminal = random_state.uniform(*self.const_range)
+                    fn = random_state.randint(self.n_features)
+                if fn == self.n_features:
+                    fn = random_state.uniform(*self.const_range)
                     if self.const_range is None:
                         # We should never get here
                         raise ValueError('A constant was produced with '
                                          'const_range=None.')
-                program[node] = terminal
+            program[node] = (fn, param)
 
         return program, list(mutate)
 

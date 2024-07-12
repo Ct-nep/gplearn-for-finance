@@ -12,6 +12,7 @@ computer programs.
 import itertools
 from abc import ABCMeta, abstractmethod
 from collections import Iterable
+from copy import copy
 from time import time
 from warnings import warn
 from typing import *
@@ -56,6 +57,7 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight,
     p_point_replace = params['p_point_replace']
     max_samples = params['max_samples']
     feature_names = params['feature_names']
+    return_pnl = params['return_pnl']
 
     max_samples = int(max_samples * n_samples)
 
@@ -167,8 +169,13 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight,
         curr_sample_weight[not_indices] = 0
         oob_sample_weight[indices] = 0
 
-        program.raw_fitness_ = program.raw_fitness(X, y, curr_sample_weight, 
-                                                   additional_data)
+        res = program.raw_fitness(X, y, curr_sample_weight, 
+                                  additional_data, return_pnl=return_pnl)
+        if return_pnl:
+            program.raw_fitness_ = res[0]
+            program._pnl = res[1]
+        else:
+            program.raw_fitness_ = res
         if max_samples < n_samples:
             # Calculate OOB fitness
             program.oob_fitness_ = program.raw_fitness(X, y, oob_sample_weight,
@@ -209,6 +216,8 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                  p_hoist_mutation=0.01,
                  p_point_mutation=0.01,
                  p_point_replace=0.05,
+                 elitism=1,
+                 variety='corr',
                  max_samples=1.0,
                  sample_days=None,
                  class_weight=None,
@@ -221,6 +230,19 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         if sample_days is not None and \
             (not isinstance(sample_days, int) or sample_days <= 0):
             raise ValueError('sample_days must be positive integer.')
+        if isinstance(elitism, float):
+            if not 0. < elitism < 1.:
+                raise ValueError(f'Elitism ratio must in range (0., 1.), '
+                                 f'got {elitism}')
+            elitism = int(elitism * population_size)
+        elif elitism is None:
+            elitism = 0
+        if not 0 <= elitism < population_size:
+            raise ValueError(f'Elitism number of genotypes must in range '
+                             f'[0, population_size), got {elitism}')
+        if variety not in [None, 'corr', 'unique']:
+            raise ValueError(f'Expect variety in [None, "corr", "unique"], '
+                             f'got {variety}')
         self.population_size = population_size
         self.hall_of_fame = hall_of_fame
         self.n_components = n_components
@@ -239,6 +261,8 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         self.p_hoist_mutation = p_hoist_mutation
         self.p_point_mutation = p_point_mutation
         self.p_point_replace = p_point_replace
+        self.elitism = elitism
+        self.variety = variety
         self.max_samples = max_samples
         self.sample_days = sample_days
         self.class_weight = class_weight
@@ -451,7 +475,8 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         if isinstance(self, ClassifierMixin):
             n_days, n_firms = y.shape
             if self.class_weight:
-                # modify the sample weights with the corresponding class weight
+                # Modify the sample weights with the corresponding class
+                # weight.
                 sample_weight = sample_weight.reshape(-1,)
                 sample_weight = (sample_weight *
                                  compute_sample_weight(self.class_weight, 
@@ -582,17 +607,21 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         params['function_set'] = self._function_set
         params['arities'] = self._arities
         params['method_probs'] = self._method_probs
+        params['return_pnl'] = self.variety == 'corr'
 
         if not self.warm_start or not hasattr(self, '_programs'):
             # Free allocated memory, if any
             self._programs = []
-            self.run_details_ = {'generation': [],
-                                 'average_length': [],
-                                 'average_fitness': [],
-                                 'best_length': [],
-                                 'best_fitness': [],
-                                 'best_oob_fitness': [],
-                                 'generation_time': []}
+            self.run_details_ = {
+                'generation': [],
+                'average_length': [],
+                'average_fitness': [],
+                'best_length': [],
+                'best_fitness': [],
+                'best_oob_fitness': [],
+                'generation_time': [],
+                'variety': [],
+            }
 
         prior_generations = len(self._programs)
         n_more_generations = self.generations - prior_generations
@@ -647,14 +676,41 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
 
             fitness = [program.raw_fitness_ for program in population]
             length = [program.length_ for program in population]
-
+            
+            # Apply elitism to preserve (near unique) best performers in
+            # previous generation.
+            if self.elitism and gen > 0 and self._programs[gen-1]:
+                fit_old = [program.fitness_ 
+                           for program in self._programs[gen-1]]
+                # Identical genotypes will be dropped by duplicative
+                # fitness (after parsimony penalty).
+                fit_unique, idx = np.unique(fit_old, return_index=True)
+                left = min(self.elitism, len(fit_unique))
+                right = len(fit_unique) - left
+                if self._metric.greater_is_better:
+                    best = fit_unique.argpartition(right)[right:]
+                    worst = np.argpartition(fitness, left)[:left]
+                else:
+                    best = fit_unique.argpartition(left)[:left]
+                    worst = np.argpartition(fitness, right)[right:]
+                best = idx[best]
+                for i in range(len(best)):
+                    population[worst[i]] = copy(self._programs[gen-1][best[i]])
+                    population[worst[i]].parents = {
+                        'method': 'Reproduction',
+                        'parent_idx': best[i],
+                        'parent_nodes': [],
+                    }
+                    fitness[worst[i]] = population[worst[i]].raw_fitness_
+                    length[worst[i]] = population[worst[i]].length_
+                    
             parsimony_coefficient = None
             if self.parsimony_coefficient == 'auto':
                 parsimony_coefficient = (np.cov(length, fitness)[1, 0] /
                                          np.var(length))
             for program in population:
                 program.fitness_ = program.fitness(parsimony_coefficient)
-
+            
             self._programs.append(population)
 
             # Remove old programs that didn't make it into the new population.
@@ -962,6 +1018,8 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
                  p_hoist_mutation=0.01,
                  p_point_mutation=0.01,
                  p_point_replace=0.05,
+                 elitism=1,
+                 variety='corr',
                  max_samples=1.0,
                  sample_days=None,
                  feature_names=None,
@@ -987,6 +1045,8 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
             p_hoist_mutation=p_hoist_mutation,
             p_point_mutation=p_point_mutation,
             p_point_replace=p_point_replace,
+            elitism=elitism,
+            variety=variety,
             max_samples=max_samples,
             sample_days=sample_days,
             feature_names=feature_names,
