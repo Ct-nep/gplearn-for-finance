@@ -227,22 +227,6 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                  n_jobs=1,
                  verbose=0,
                  random_state=None):
-        if sample_days is not None and \
-            (not isinstance(sample_days, int) or sample_days <= 0):
-            raise ValueError('sample_days must be positive integer.')
-        if isinstance(elitism, float):
-            if not 0. < elitism < 1.:
-                raise ValueError(f'Elitism ratio must in range (0., 1.), '
-                                 f'got {elitism}')
-            elitism = int(elitism * population_size)
-        elif elitism is None:
-            elitism = 0
-        if not 0 <= elitism < population_size:
-            raise ValueError(f'Elitism number of genotypes must in range '
-                             f'[0, population_size), got {elitism}')
-        if variety not in [None, 'corr', 'unique']:
-            raise ValueError(f'Expect variety in [None, "corr", "unique"], '
-                             f'got {variety}')
         self.population_size = population_size
         self.hall_of_fame = hall_of_fame
         self.n_components = n_components
@@ -283,12 +267,13 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
 
         """
         if run_details is None:
-            print('    |{:^25}|{:^42}|'.format('Population Average',
+            print('    |{:^26}|{:^26}|'.format('Population Average',
                                                'Best Individual'))
-            print('-' * 4 + ' ' + '-' * 25 + ' ' + '-' * 42 + ' ' + '-' * 10)
-            line_format = '{:>4} {:>8} {:>16} {:>8} {:>16} {:>16} {:>10}'
-            print(line_format.format('Gen', 'Length', 'Fitness', 'Length',
-                                     'Fitness', 'OOB Fitness', 'Time Left'))
+            print('-' * 4 + ' ' + '-' * 26 + ' ' + '-' * 26 + ' ' + '-' * 10)
+            line_format = '{:>4} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10}'
+            print(line_format.format('Gen', 'Length', 'Variety', 'Fitness', 
+                                     'Length', 'Fitness', 'OOB Fitness', 
+                                     'Time Left'))
 
         else:
             # Estimate remaining time for run
@@ -301,13 +286,16 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                 remaining_time = '{0:.2f}s'.format(remaining_time)
 
             oob_fitness = 'N/A'
-            line_format = '{:4d} {:8.2f} {:16g} {:8d} {:16g} {:>16} {:>10}'
+            line_format = \
+                '{:4d} {:8.2f} {:8.4f} {:8g} {:8d} {:8g} {:>8} {:>10}'
             if self.max_samples < 1.0:
                 oob_fitness = run_details['best_oob_fitness'][-1]
-                line_format = '{:4d} {:8.2f} {:16g} {:8d} {:16g} {:16g} {:>10}'
+                line_format = \
+                    '{:4d} {:8.2f} {:8.4f} {:8g} {:8d} {:8g} {:8g} {:>10}'
 
             print(line_format.format(run_details['generation'][-1],
                                      run_details['average_length'][-1],
+                                     run_details['variety'][-1],
                                      run_details['average_fitness'][-1],
                                      run_details['best_length'][-1],
                                      run_details['best_fitness'][-1],
@@ -468,8 +456,24 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         self : object
             Returns self.
         """
-        random_state = check_random_state(self.random_state)
+        if self.sample_days is not None and \
+            (not isinstance(self.sample_days, int) or self.sample_days <= 0):
+            raise ValueError('sample_days must be positive integer.')
+        if isinstance(self.elitism, float):
+            if not 0. < self.elitism < 1.:
+                raise ValueError(f'Elitism ratio must in range (0., 1.), '
+                                 f'got {self.elitism}')
+            self.elitism = int(self.elitism * self.population_size)
+        elif self.elitism is None:
+            self.elitism = 0
+        if not 0 <= self.elitism < self.population_size:
+            raise ValueError(f'Elitism number of genotypes must in range '
+                             f'[0, population_size), got {self.elitism}')
+        if self.variety not in [None, 'corr', 'unique']:
+            raise ValueError(f'Expect variety in [None, "corr", "fitness"], '
+                             f'got {self.variety}')
 
+        random_state = check_random_state(self.random_state)
         X, y, sample_weight, additional_data, _, _ = \
             self._validate_data(X, y, sample_weight, additional_data, fit=True)
         if isinstance(self, ClassifierMixin):
@@ -674,7 +678,8 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             # Reduce, maintaining order across different n_jobs
             population = list(itertools.chain.from_iterable(population))
 
-            fitness = [program.raw_fitness_ for program in population]
+            fitness = np.array([program.raw_fitness_ 
+                                for program in population])
             length = [program.length_ for program in population]
             
             # Apply elitism to preserve (near unique) best performers in
@@ -729,6 +734,34 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             elif gen > 0:
                 # Remove old generations
                 self._programs[gen - 1] = None
+                
+            # Calculate population variety:
+            #  - Method 'fitness' uses a non-parametric estimation of
+            #    binned phenotype (raw fitness) distribution entropy,
+            #    which is derived from -sum(p_i * log(p_i)) / log(10),
+            #    where p_i is prob of raw fitness falling into i-th
+            #    equally spaced bin out of 10. 
+            #  - Method 'corr' requires pnl corr matrix (additional
+            #    memory cost for caching) and is derived from 1.0 -
+            #    norm(corr) / sqrt(corr.size).
+            #  - Method None leaves variety as NaN.
+            variety = np.nan
+            if self.variety == 'fitness':
+                minimum, maximum = fitness.min(), fitness.max()
+                if minimum == maximum:
+                    variety = 0.
+                else:
+                    bins = np.linspace(minimum, maximum+1e-9, 10)
+                    bins = np.digitize(fitness, bins)
+                    _, count = np.unique(bins, return_counts=True)
+                    count /= len(fitness)
+                    variety = np.nansum(count * np.log(count)) / np.log(10.)
+            elif self.variety == 'corr':
+                corr = np.stack([program._pnl for program in population], 
+                               axis=1)
+                corr = np.corrcoef(corr)
+                variety = 1. - np.linalg.norm(corr) / np.sqrt(corr.size)
+            self.run_details_['variety'].append(variety)
 
             # Record run details
             if self._metric.greater_is_better:
