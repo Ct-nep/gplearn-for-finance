@@ -1,0 +1,6 @@
+[run]
+branch = True
+source = gplearn
+omit =
+    */gplearn/tests/*
+    */gplearn/doc/*
