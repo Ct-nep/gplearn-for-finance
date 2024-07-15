@@ -40,7 +40,7 @@ MAX_INT = np.iinfo(np.int32).max
 
 
 def _parallel_evolve(n_programs, parents, X, y, sample_weight, 
-                     additional_data, seeds, params):
+                     trans_args, seeds, params):
     """Private function used to build a batch of programs within a job."""
     n_samples, n_features = X.shape[:2]
     # Unpack parameters
@@ -55,11 +55,11 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight,
     parsimony_coefficient = params['parsimony_coefficient']
     method_probs = params['method_probs']
     p_point_replace = params['p_point_replace']
-    max_samples = params['max_samples']
+    is_split = params['is_split']
     feature_names = params['feature_names']
     return_pnl = params['return_pnl']
 
-    max_samples = int(max_samples * n_samples)
+    is_split = int(is_split * n_samples)
 
     def _tournament():
         """Find the fittest individual from a sub-population."""
@@ -160,26 +160,24 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight,
         #             raise RuntimeError(err_msg)
         #     else:
         #         raise RuntimeError(err_msg)
-        oob_sample_weight = curr_sample_weight.copy()
+        os_sample_weight = curr_sample_weight.copy()
 
-        indices, not_indices = program.get_all_indices(n_samples,
-                                                       max_samples,
-                                                       random_state)
+        indices, not_indices = program.get_all_indices(n_samples, is_split)
 
         curr_sample_weight[not_indices] = 0
-        oob_sample_weight[indices] = 0
+        os_sample_weight[indices] = 0
 
         res = program.raw_fitness(X, y, curr_sample_weight, 
-                                  additional_data, return_pnl=return_pnl)
+                                  trans_args, return_pnl=return_pnl)
         if return_pnl:
             program.raw_fitness_ = res[0]
             program._pnl = res[1]
         else:
             program.raw_fitness_ = res
-        if max_samples < n_samples:
-            # Calculate OOB fitness
-            program.oob_fitness_ = program.raw_fitness(X, y, oob_sample_weight,
-                                                       additional_data)
+        if is_split < n_samples:
+            # Calculate OS fitness
+            program.os_fitness_ = program.raw_fitness(X, y, os_sample_weight,
+                                                       trans_args)
 
         programs.append(program)
 
@@ -218,7 +216,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                  p_point_replace=0.05,
                  elitism=1,
                  variety='corr',
-                 max_samples=1.0,
+                 is_split=1.0,
                  sample_days=None,
                  class_weight=None,
                  feature_names=None,
@@ -247,7 +245,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         self.p_point_replace = p_point_replace
         self.elitism = elitism
         self.variety = variety
-        self.max_samples = max_samples
+        self.is_split = is_split
         self.sample_days = sample_days
         self.class_weight = class_weight
         self.feature_names = feature_names
@@ -272,7 +270,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             print('-' * 4 + ' ' + '-' * 26 + ' ' + '-' * 26 + ' ' + '-' * 10)
             line_format = '{:>4} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10}'
             print(line_format.format('Gen', 'Length', 'Variety', 'Fitness', 
-                                     'Length', 'Fitness', 'OOB Fitness', 
+                                     'Length', 'Fitness', 'OS Fitness', 
                                      'Time Left'))
 
         else:
@@ -285,11 +283,11 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             else:
                 remaining_time = '{0:.2f}s'.format(remaining_time)
 
-            oob_fitness = 'N/A'
+            os_fitness = 'N/A'
             line_format = \
                 '{:4d} {:8.2f} {:8.4f} {:8g} {:8d} {:8g} {:>8} {:>10}'
-            if self.max_samples < 1.0:
-                oob_fitness = run_details['best_oob_fitness'][-1]
+            if self.is_split < 1.0:
+                os_fitness = run_details['best_os_fitness'][-1]
                 line_format = \
                     '{:4d} {:8.2f} {:8.4f} {:8g} {:8d} {:8g} {:8g} {:>10}'
 
@@ -299,10 +297,10 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                                      run_details['average_fitness'][-1],
                                      run_details['best_length'][-1],
                                      run_details['best_fitness'][-1],
-                                     oob_fitness,
+                                     os_fitness,
                                      remaining_time))
     
-    def _validate_data(self, X, y, sample_weight, additional_data, fit=False):
+    def _validate_data(self, X, y, sample_weight, trans_args, fit=False):
         '''Patch parent's _validate_data() method for 3-dim situation.
         Due to drastic change of behavior, it is no long suitable to
         rely on sklearn's validate method.
@@ -313,17 +311,18 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         
         Parameters
         ----------
-        X : List[pd.DataFrame] or array-like, shape=(n_days, n_features,
+        X : List[pd.DataFrame] or array-like, shape = (n_samples,
+        n_features, n_firms)
+            See self.fit().
+
+        y : None or pd.DataFrame or array-like, shape = (n_samples,
         n_firms)
             See self.fit().
 
-        y : None or pd.DataFrame or array-like, shape=(n_days, n_firms)
-            See self.fit().
-
-        sample_weight : None or pd.DataFrame or array-like,
-        shape=(n_days,) or (n_days, n_firms)
+        sample_weight : None or pd.DataFrame or array-like, shape =
+        (n_samples,) or (n_samples, n_firms)
             
-        additional_data : None or dict of DataFrame / array-like
+        trans_args : None or dict of DataFrame / array-like
             See self.fit().
             
         fit : bool, default=False
@@ -375,15 +374,15 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             if len(sample_weight) == 1:
                 sample_weight = np.broadcast_to(sample_weight[..., None], 
                                                 y.shape)
-        if additional_data is None:
-            additional_data = dict()
-        for k, v in additional_data.items():
+        if trans_args is None:
+            trans_args = dict()
+        for k, v in trans_args.items():
             if v is None:
-                del additional_data[k]
+                del trans_args[k]
             # Ensure 2d but no dtype check.
             else:
                 try:
-                    additional_data[k] = check_array(v, dtype=None)
+                    trans_args[k] = check_array(v, dtype=None)
                 except Exception as e:
                     raise ValueError(f'Cannot coerce additional data {k} '
                                     f'to compatible structure: {e}')
@@ -399,53 +398,54 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             raise ValueError(f'X, y must have same shape except on '
                                 f'n_feature dim, received {X.shape}, '
                                 f'{y.shape}')
-        for k, v in additional_data.items():
+        for k, v in trans_args.items():
             if X_shape != v.shape:
                 raise ValueError(f'Any additional data must have shape '
-                                 f'(n_days, n_firms), received '
+                                 f'(n_samples, n_firms), received '
                                  f'{v.shape} for key {k}')
         # Similar to sklearn's check on classifier label.
         if y is not None and isinstance(self, ClassifierMixin):
-            if np.issubdtype(y.dtype, float):
+            if np.issubdtype(y.dtype, np.floating):
                 mask = np.isfinite(y)
                 if not (y[mask] == y[mask].astype(int)).all():
                     raise ValueError('y cannot be continuous float.')
-            elif np.issubdtype(y.dtype, int):
+            elif np.issubdtype(y.dtype, np.integer):
                 y = y.astype(float)
-            elif not np.issubdtype(y.dtype, str):
+            elif not np.issubdtype(y.dtype, np.str_):
                 raise ValueError(f'Require label y to be int, string or '
                                     f'int-like float, received {y.dtype}.')
-        return (X, y, sample_weight, additional_data, idx, col)
+        return (X, y, sample_weight, trans_args, idx, col)
     
     def fit(
         self, 
         X: Union[List[pd.DataFrame], np.ndarray], 
         y: np.ndarray, 
         sample_weight: Union[None, np.ndarray] = None, 
-        additional_data: Union[None, Dict[str, np.ndarray]] = None,
+        trans_args: Union[None, Dict[str, np.ndarray]] = None,
     ) -> object:
         """Fit the Genetic Program according to X, y.
 
         Parameters
         ----------
-        X : List[pd.DataFrame] or array-like, shape = (n_days,
+        X : List[pd.DataFrame] or array-like, shape = (n_samples,
         n_features, n_firms)
-            Training vectors, where n_days is the number of trading days
-            as samples, n_features is the number of features, n_firms is
-            number of firms / stocks.  If provided as DataFrames, must
-            have same index / columns, with shape (n_days, n_firms).
+            Training vectors, where n_samples is the number of trading
+            days as samples, n_features is the number of features,
+            n_firms is number of firms / stocks.  If provided as
+            DataFrames, must have same index / columns, with shape
+            (n_samples, n_firms).
 
-        y : None, pd.DataFrame or array-like, shape = (n_days, n_firms)
+        y : None, pd.DataFrame or array-like, shape = (n_samples, n_firms)
             Target values, if provided as DataFrame, must have same
-            index / columns with all X DataFrame, with shape (n_days,
+            index / columns with all X DataFrame, with shape (n_samples,
             n_firms).
 
-        sample_weight : optional, None or pd.DataFrame or array-like,
-        shape = (n_days,) or (n_days, n_firms), default = None
+        sample_weight : None or pd.DataFrame or array-like, shape =
+        (n_samples,) or (n_samples, n_firms), optional, default = None
             Weights applied to individual samples. Will be broadcast to
             2d if supplied as 1d array / Series.
             
-        additional_data : optional, None or dict, default = None
+        trans_args : None or dict, optional, default = None
             Additional information like instrument universe, industry
             classification etc. If provided, will be passed to fitness
             evaluation function. The method only check shape of these
@@ -474,10 +474,10 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                              f'got {self.variety}')
 
         random_state = check_random_state(self.random_state)
-        X, y, sample_weight, additional_data, _, _ = \
-            self._validate_data(X, y, sample_weight, additional_data, fit=True)
+        X, y, sample_weight, trans_args, _, _ = \
+            self._validate_data(X, y, sample_weight, trans_args, fit=True)
         if isinstance(self, ClassifierMixin):
-            n_days, n_firms = y.shape
+            n_samples, n_firms = y.shape
             if self.class_weight:
                 # Modify the sample weights with the corresponding class
                 # weight.
@@ -485,7 +485,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                 sample_weight = (sample_weight *
                                  compute_sample_weight(self.class_weight, 
                                                        y.reshape(-1,)))
-                sample_weight = sample_weight.reshape(n_days, n_firms)
+                sample_weight = sample_weight.reshape(n_samples, n_firms)
 
             self.classes_, y = np.unique(y, return_inverse=True)
             n_trim_classes = np.count_nonzero(np.bincount(y, sample_weight))
@@ -494,7 +494,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                                  "trimmed classes with zero weights, while 2 "
                                  "classes are required."
                                  % n_trim_classes)
-            y = y.reshape(n_days, n_firms).astype(float)
+            y = y.reshape(n_samples, n_firms).astype(float)
             self.n_classes_ = len(self.classes_)
 
         hall_of_fame = self.hall_of_fame
@@ -622,7 +622,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                 'average_fitness': [],
                 'best_length': [],
                 'best_fitness': [],
-                'best_oob_fitness': [],
+                'best_os_fitness': [],
                 'generation_time': [],
                 'variety': [],
             }
@@ -670,7 +670,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                                           X,
                                           y,
                                           sample_weight,
-                                          additional_data,
+                                          trans_args,
                                           seeds[starts[i]:starts[i + 1]],
                                           params)
                 for i in range(n_jobs))
@@ -683,7 +683,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             length = [program.length_ for program in population]
             
             # Apply elitism to preserve (near unique) best performers in
-            # previous generation.
+            # previous generation, after parsimony penalty.
             if self.elitism and gen > 0 and self._programs[gen-1]:
                 fit_old = [program.fitness_ 
                            for program in self._programs[gen-1]]
@@ -774,10 +774,10 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             self.run_details_['average_fitness'].append(np.mean(fitness))
             self.run_details_['best_length'].append(best_program.length_)
             self.run_details_['best_fitness'].append(best_program.raw_fitness_)
-            oob_fitness = np.nan
-            if self.max_samples < 1.0:
-                oob_fitness = best_program.oob_fitness_
-            self.run_details_['best_oob_fitness'].append(oob_fitness)
+            os_fitness = np.nan
+            if self.is_split < 1.0:
+                os_fitness = best_program.os_fitness_
+            self.run_details_['best_os_fitness'].append(os_fitness)
             generation_time = time() - start_time
             self.run_details_['generation_time'].append(generation_time)
 
@@ -850,30 +850,30 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
 
     Parameters
     ----------
-    population_size : integer, optional (default=1000)
+    population_size : integer, optional, default = 1000
         The number of programs in each generation.
 
-    generations : integer, optional (default=20)
+    generations : integer, optional, default = 20
         The number of generations to evolve.
 
-    tournament_size : integer, optional (default=20)
+    tournament_size : integer, optional, default = 20
         The number of programs that will compete to become part of the next
         generation.
 
-    stopping_criteria : float, optional (default=0.0)
+    stopping_criteria : float, optional, default = 0.0
         The required metric value required in order to stop evolution early.
 
-    const_range : tuple of two floats, or None, optional (default=(-1., 1.))
+    const_range : tuple of two floats, or None, optional, default = (-1., 1.)
         The range of constants to include in the formulas. If None then no
         constants will be included in the candidate programs.
 
-    init_depth : tuple of two ints, optional (default=(2, 6))
+    init_depth : tuple of two ints, optional, default = (2, 6)
         The range of tree depths for the initial population of naive formulas.
         Individual trees will randomly choose a maximum depth from this range.
         When combined with `init_method='half and half'` this yields the well-
         known 'ramped half and half' initialization method.
 
-    init_method : str, optional (default='half and half')
+    init_method : str, optional, default = 'half and half'
         - 'grow' : Nodes are chosen at random from both functions and
           terminals, allowing for smaller trees than `init_depth` allows. Tends
           to grow asymmetrical trees.
@@ -882,7 +882,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
         - 'half and half' : Trees are grown through a 50/50 mix of 'full' and
           'grow', making for a mix of tree shapes in the initial population.
 
-    function_set : iterable, optional (default=('add', 'sub', 'mul', 'div'))
+    function_set : iterable, optional, default = ('add', 'sub', 'mul', 'div')
         The functions to use when building and evolving programs. This iterable
         can include strings to indicate either individual functions as outlined
         below, or you can also include your own functions as built using the
@@ -909,7 +909,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
         - 'cos' : cosine (radians), arity=1.
         - 'tan' : tangent (radians), arity=1.
 
-    metric : str, optional (default='mean absolute error')
+    metric : str, optional, default='mean absolute error'
         The name of the raw fitness metric. Available options include:
 
         - 'mean absolute error'.
@@ -923,8 +923,18 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
         This would allow the user to generate one engineered feature at a time,
         using the SymbolicTransformer would allow creation of multiple features
         at once.
+        
+    transformer : None or _Function, optional, default = None
+        A transformer function applied to raw weight after calculation,
+        which may neutralize weight and apply restriction of tradable
+        instruments at each day. 
+        If provided, must be a _Function object created from
+        ``make_function`` factory with args (y_pred, trans_args), where
+        ``y_pred`` is raw_weight, and ``trans_args`` is a dict passed by
+        calling ``fit`` or ``predict`` to store other useful info. See
+        example for how could it be utilized.
 
-    parsimony_coefficient : float or "auto", optional (default=0.001)
+    parsimony_coefficient : float or "auto", optional, default = 0.001
         This constant penalizes large programs by adjusting their fitness to
         be less favorable for selection. Larger values penalize the program
         more which can control the phenomenon known as 'bloat'. Bloat is when
@@ -938,7 +948,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
         program size l and program fitness f in the population, and Var(l) is
         the variance of program sizes.
 
-    p_crossover : float, optional (default=0.9)
+    p_crossover : float, optional, default = 0.9
         The probability of performing crossover on a tournament winner.
         Crossover takes the winner of a tournament and selects a random subtree
         from it to be replaced. A second tournament is performed to find a
@@ -946,62 +956,86 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
         inserted into the original parent to form an offspring in the next
         generation.
 
-    p_subtree_mutation : float, optional (default=0.01)
+    p_subtree_mutation : float, optional, default = 0.01
         The probability of performing subtree mutation on a tournament winner.
         Subtree mutation takes the winner of a tournament and selects a random
         subtree from it to be replaced. A donor subtree is generated at random
         and this is inserted into the original parent to form an offspring in
         the next generation.
 
-    p_hoist_mutation : float, optional (default=0.01)
+    p_hoist_mutation : float, optional, default = 0.01
         The probability of performing hoist mutation on a tournament winner.
         Hoist mutation takes the winner of a tournament and selects a random
         subtree from it. A random subtree of that subtree is then selected
         and this is 'hoisted' into the original subtrees location to form an
         offspring in the next generation. This method helps to control bloat.
 
-    p_point_mutation : float, optional (default=0.01)
-        The probability of performing point mutation on a tournament winner.
-        Point mutation takes the winner of a tournament and selects random
-        nodes from it to be replaced. Terminals are replaced by other terminals
-        and functions are replaced by other functions that require the same
-        number of arguments as the original node. The resulting tree forms an
-        offspring in the next generation.
+    p_point_mutation : float, optional, default = 0.01
+        The probability of performing point mutation on a tournament
+        winner. Point mutation takes the winner of a tournament and
+        selects random nodes from it to be replaced.  Terminals are
+        replaced by other terminals and functions are replaced by other
+        functions that require the same number of arguments as the
+        original node. The resulting tree forms an offspring in the next
+        generation.
 
         Note : The above genetic operation probabilities must sum to less than
         one. The balance of probability is assigned to 'reproduction', where a
         tournament winner is cloned and enters the next generation unmodified.
 
-    p_point_replace : float, optional (default=0.05)
+    p_point_replace : float, optional, default = 0.05
         For point mutation only, the probability that any given node will be
-        mutated.
+        mutated. 
+        Half of the time, only parameters of the function is replaced
+        within its valid param range, so the user may want to increase
+        this prob more than vanila gplearn version.
+        
+    elitism : int or float, optional, default = 1
+        Number or fraction of best performing samples among previous
+        population generation being carried to next interation intact.
+        Ensure best results will never be discarded by randomness.
+        
+    variety : None or "fitness" or "corr", optional, default = None
+        Measure of variety of population. If selected, will be report
+        alongside other metrics in ``fit``. Two metrics are supported:
+        
+        - "fitness" : Use 10 equally spaced bin between min / max
+          fitness of current population, and estimated non-parametric
+          distribution of sample fitness. Calculate entropy of prob
+          density: Variety = -sum(p_i * log(p_i)) / log(10)
+        - "corr" : Cache each genotype's PNL when evaluating fitness,
+          then calculate measure of correlation from stacked PNL matrix:
+          Variety = 1.0 - norm(corr_matrix) / sqrt(corr_matrix.size)
 
-    max_samples : float, optional (default=1.0)
-        The fraction of samples to draw from X to evaluate each program on.
+    is_split : float, optional, default = 1.0
+        The fraction of samples from X to evaluate each program on. If
+        smaller than 1.0, split by ratio so first (n_samples * is_split)
+        entries are in-the-sample and others are out-of-sample. This is
+        suitable for time-series in ascending order.
 
-    feature_names : list, optional (default=None)
+    feature_names : list, optional, default = None
         Optional list of feature names, used purely for representations in
         the `print` operation or `export_graphviz`. If None, then X0, X1, etc
         will be used for representations.
 
-    warm_start : bool, optional (default=False)
+    warm_start : bool, optional, default = False
         When set to ``True``, reuse the solution of the previous call to fit
         and add more generations to the evolution, otherwise, just fit a new
         evolution.
 
-    low_memory : bool, optional (default=False)
+    low_memory : bool, optional, default = False
         When set to ``True``, only the current generation is retained. Parent
         information is discarded. For very large populations or runs with many
         generations, this can result in substantial memory use reduction.
 
-    n_jobs : integer, optional (default=1)
+    n_jobs : integer, optional, default = 1
         The number of jobs to run in parallel for `fit`. If -1, then the number
         of jobs is set to the number of cores.
 
-    verbose : int, optional (default=0)
+    verbose : int, optional, default = 0
         Controls the verbosity of the evolution building process.
 
-    random_state : int, RandomState instance or None, optional (default=None)
+    random_state : int, RandomState instance or None, optional, default = None
         If int, random_state is the seed used by the random number generator;
         If RandomState instance, random_state is the random number generator;
         If None, the random number generator is the RandomState instance used
@@ -1015,15 +1049,12 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
         - 'generation' : The generation index.
         - 'average_length' : The average program length of the generation.
         - 'average_fitness' : The average program fitness of the generation.
+        - 'variety' : Measure of population variety of the generation.
         - 'best_length' : The length of the best program in the generation.
         - 'best_fitness' : The fitness of the best program in the generation.
-        - 'best_oob_fitness' : The out of bag fitness of the best program in
-          the generation (requires `max_samples` < 1.0).
+        - 'best_os_fitness' : The out of sample fitness of the best
+          program in the generation (requires `is_split` < 1.0).
         - 'generation_time' : The time it took for the generation to evolve.
-
-    See Also
-    --------
-    SymbolicTransformer
 
     References
     ----------
@@ -1053,7 +1084,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
                  p_point_replace=0.05,
                  elitism=1,
                  variety='corr',
-                 max_samples=1.0,
+                 is_split=1.0,
                  sample_days=None,
                  feature_names=None,
                  warm_start=False,
@@ -1080,7 +1111,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
             p_point_replace=p_point_replace,
             elitism=elitism,
             variety=variety,
-            max_samples=max_samples,
+            is_split=is_split,
             sample_days=sample_days,
             feature_names=feature_names,
             warm_start=warm_start,
@@ -1098,7 +1129,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
     def predict(
         self, 
         X: Union[List[pd.DataFrame], np.ndarray], 
-        additional_data: Union[None, Dict[str, np.ndarray]] = None,
+        trans_args: Union[None, Dict[str, np.ndarray]] = None,
         transform: bool = True,
     ) -> Union[pd.DataFrame, np.ndarray]:
         """Calculate portfolio weight using the best single program
@@ -1106,14 +1137,15 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
 
         Parameters
         ----------
-        X : List[pd.DataFrame] or array-like, shape = (n_days,
+        X : List[pd.DataFrame] or array-like, shape = (n_samples,
         n_features, n_firms)
-            Training vectors, where n_days is the number of trading days
-            as samples, n_features is the number of features, n_firms is
-            number of firms / stocks.  If provided as DataFrames, must
-            have same index / columns, with shape (n_days, n_firms).
+            Training vectors, where n_samples is the number of trading
+            days as samples, n_features is the number of features,
+            n_firms is number of firms / stocks.  If provided as
+            DataFrames, must have same index / columns, with shape
+            (n_samples, n_firms).
             
-        additional_data : optional, None or dict, default = None
+        trans_args : optional, None or dict, default = None
             Additional information like instrument universe, industry
             classification etc. If provided, will be passed to weight
             transform function. The method only check shape of these
@@ -1125,15 +1157,15 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
 
         Returns
         -------
-        weight : pd.DataFrame or array-like, shape = (n_days, n_firms)
+        weight : pd.DataFrame or array-like, shape = (n_samples, n_firms)
             Returns weight. If X is list of DataFrames, return weight as
             DataFrame of same shape, index and columns.
         """
         if not hasattr(self, '_program'):
             raise NotFittedError('SymbolicRegressor not fitted.')
 
-        X, _, _, additional_data, ind, col = \
-            self._validate_data(X, None, None, additional_data, fit=False)
+        X, _, _, trans_args, ind, col = \
+            self._validate_data(X, None, None, trans_args, fit=False)
         n_features = X.shape[1]
         if self.n_features_in_ != n_features:
             raise ValueError('Number of features of the model must match the '
@@ -1143,702 +1175,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
 
         y = self._program.execute(X)
         if transform and getattr(self, '_transformer', None) is not None:
-            y = self._transformer(y, additional_data)
+            y = self._transformer(y, trans_args)
         if ind is not None:
             y = pd.DataFrame(y, index=ind, columns=col)
         return y
-
-
-# class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
-
-#     """A Genetic Programming symbolic classifier.
-
-#     A symbolic classifier is an estimator that begins by building a population
-#     of naive random formulas to represent a relationship. The formulas are
-#     represented as tree-like structures with mathematical functions being
-#     recursively applied to variables and constants. Each successive generation
-#     of programs is then evolved from the one that came before it by selecting
-#     the fittest individuals from the population to undergo genetic operations
-#     such as crossover, mutation or reproduction.
-
-#     Parameters
-#     ----------
-#     population_size : integer, optional (default=500)
-#         The number of programs in each generation.
-
-#     generations : integer, optional (default=10)
-#         The number of generations to evolve.
-
-#     tournament_size : integer, optional (default=20)
-#         The number of programs that will compete to become part of the next
-#         generation.
-
-#     stopping_criteria : float, optional (default=0.0)
-#         The required metric value required in order to stop evolution early.
-
-#     const_range : tuple of two floats, or None, optional (default=(-1., 1.))
-#         The range of constants to include in the formulas. If None then no
-#         constants will be included in the candidate programs.
-
-#     init_depth : tuple of two ints, optional (default=(2, 6))
-#         The range of tree depths for the initial population of naive formulas.
-#         Individual trees will randomly choose a maximum depth from this range.
-#         When combined with `init_method='half and half'` this yields the well-
-#         known 'ramped half and half' initialization method.
-
-#     init_method : str, optional (default='half and half')
-#         - 'grow' : Nodes are chosen at random from both functions and
-#           terminals, allowing for smaller trees than `init_depth` allows. Tends
-#           to grow asymmetrical trees.
-#         - 'full' : Functions are chosen until the `init_depth` is reached, and
-#           then terminals are selected. Tends to grow 'bushy' trees.
-#         - 'half and half' : Trees are grown through a 50/50 mix of 'full' and
-#           'grow', making for a mix of tree shapes in the initial population.
-
-#     function_set : iterable, optional (default=('add', 'sub', 'mul', 'div'))
-#         The functions to use when building and evolving programs. This iterable
-#         can include strings to indicate either individual functions as outlined
-#         below, or you can also include your own functions as built using the
-#         ``make_function`` factory from the ``functions`` module.
-
-#         Available individual functions are:
-
-#         - 'add' : addition, arity=2.
-#         - 'sub' : subtraction, arity=2.
-#         - 'mul' : multiplication, arity=2.
-#         - 'div' : protected division where a denominator near-zero returns 1.,
-#           arity=2.
-#         - 'sqrt' : protected square root where the absolute value of the
-#           argument is used, arity=1.
-#         - 'log' : protected log where the absolute value of the argument is
-#           used and a near-zero argument returns 0., arity=1.
-#         - 'abs' : absolute value, arity=1.
-#         - 'neg' : negative, arity=1.
-#         - 'inv' : protected inverse where a near-zero argument returns 0.,
-#           arity=1.
-#         - 'max' : maximum, arity=2.
-#         - 'min' : minimum, arity=2.
-#         - 'sin' : sine (radians), arity=1.
-#         - 'cos' : cosine (radians), arity=1.
-#         - 'tan' : tangent (radians), arity=1.
-
-#     transformer : str, optional (default='sigmoid')
-#         The name of the function through which the raw decision function is
-#         passed. This function will transform the raw decision function into
-#         probabilities of each class.
-
-#         This can also be replaced by your own functions as built using the
-#         ``make_function`` factory from the ``functions`` module.
-
-#     metric : str, optional (default='log loss')
-#         The name of the raw fitness metric. Available options include:
-
-#         - 'log loss' aka binary cross-entropy loss.
-
-#     parsimony_coefficient : float or "auto", optional (default=0.001)
-#         This constant penalizes large programs by adjusting their fitness to
-#         be less favorable for selection. Larger values penalize the program
-#         more which can control the phenomenon known as 'bloat'. Bloat is when
-#         evolution is increasing the size of programs without a significant
-#         increase in fitness, which is costly for computation time and makes for
-#         a less understandable final result. This parameter may need to be tuned
-#         over successive runs.
-
-#         If "auto" the parsimony coefficient is recalculated for each generation
-#         using c = Cov(l,f)/Var( l), where Cov(l,f) is the covariance between
-#         program size l and program fitness f in the population, and Var(l) is
-#         the variance of program sizes.
-
-#     p_crossover : float, optional (default=0.9)
-#         The probability of performing crossover on a tournament winner.
-#         Crossover takes the winner of a tournament and selects a random subtree
-#         from it to be replaced. A second tournament is performed to find a
-#         donor. The donor also has a subtree selected at random and this is
-#         inserted into the original parent to form an offspring in the next
-#         generation.
-
-#     p_subtree_mutation : float, optional (default=0.01)
-#         The probability of performing subtree mutation on a tournament winner.
-#         Subtree mutation takes the winner of a tournament and selects a random
-#         subtree from it to be replaced. A donor subtree is generated at random
-#         and this is inserted into the original parent to form an offspring in
-#         the next generation.
-
-#     p_hoist_mutation : float, optional (default=0.01)
-#         The probability of performing hoist mutation on a tournament winner.
-#         Hoist mutation takes the winner of a tournament and selects a random
-#         subtree from it. A random subtree of that subtree is then selected
-#         and this is 'hoisted' into the original subtrees location to form an
-#         offspring in the next generation. This method helps to control bloat.
-
-#     p_point_mutation : float, optional (default=0.01)
-#         The probability of performing point mutation on a tournament winner.
-#         Point mutation takes the winner of a tournament and selects random
-#         nodes from it to be replaced. Terminals are replaced by other terminals
-#         and functions are replaced by other functions that require the same
-#         number of arguments as the original node. The resulting tree forms an
-#         offspring in the next generation.
-
-#         Note : The above genetic operation probabilities must sum to less than
-#         one. The balance of probability is assigned to 'reproduction', where a
-#         tournament winner is cloned and enters the next generation unmodified.
-
-#     p_point_replace : float, optional (default=0.05)
-#         For point mutation only, the probability that any given node will be
-#         mutated.
-
-#     max_samples : float, optional (default=1.0)
-#         The fraction of samples to draw from X to evaluate each program on.
-
-#     class_weight : dict, 'balanced' or None, optional (default=None)
-#         Weights associated with classes in the form ``{class_label: weight}``.
-#         If not given, all classes are supposed to have weight one.
-
-#         The "balanced" mode uses the values of y to automatically adjust
-#         weights inversely proportional to class frequencies in the input data
-#         as ``n_samples / (n_classes * np.bincount(y))``
-
-#     feature_names : list, optional (default=None)
-#         Optional list of feature names, used purely for representations in
-#         the `print` operation or `export_graphviz`. If None, then X0, X1, etc
-#         will be used for representations.
-
-#     warm_start : bool, optional (default=False)
-#         When set to ``True``, reuse the solution of the previous call to fit
-#         and add more generations to the evolution, otherwise, just fit a new
-#         evolution.
-
-#     low_memory : bool, optional (default=False)
-#         When set to ``True``, only the current generation is retained. Parent
-#         information is discarded. For very large populations or runs with many
-#         generations, this can result in substantial memory use reduction.
-
-#     n_jobs : integer, optional (default=1)
-#         The number of jobs to run in parallel for `fit`. If -1, then the number
-#         of jobs is set to the number of cores.
-
-#     verbose : int, optional (default=0)
-#         Controls the verbosity of the evolution building process.
-
-#     random_state : int, RandomState instance or None, optional (default=None)
-#         If int, random_state is the seed used by the random number generator;
-#         If RandomState instance, random_state is the random number generator;
-#         If None, the random number generator is the RandomState instance used
-#         by `np.random`.
-
-#     Attributes
-#     ----------
-#     run_details_ : dict
-#         Details of the evolution process. Includes the following elements:
-
-#         - 'generation' : The generation index.
-#         - 'average_length' : The average program length of the generation.
-#         - 'average_fitness' : The average program fitness of the generation.
-#         - 'best_length' : The length of the best program in the generation.
-#         - 'best_fitness' : The fitness of the best program in the generation.
-#         - 'best_oob_fitness' : The out of bag fitness of the best program in
-#           the generation (requires `max_samples` < 1.0).
-#         - 'generation_time' : The time it took for the generation to evolve.
-
-#     See Also
-#     --------
-#     SymbolicTransformer
-
-#     References
-#     ----------
-#     .. [1] J. Koza, "Genetic Programming", 1992.
-
-#     .. [2] R. Poli, et al. "A Field Guide to Genetic Programming", 2008.
-
-#     """
-
-#     def __init__(self,
-#                  *,
-#                  population_size=1000,
-#                  generations=20,
-#                  tournament_size=20,
-#                  stopping_criteria=0.0,
-#                  const_range=(-1., 1.),
-#                  init_depth=(2, 6),
-#                  init_method='half and half',
-#                  function_set=('add', 'sub', 'mul', 'div'),
-#                  transformer='sigmoid',
-#                  metric='log loss',
-#                  parsimony_coefficient=0.001,
-#                  p_crossover=0.9,
-#                  p_subtree_mutation=0.01,
-#                  p_hoist_mutation=0.01,
-#                  p_point_mutation=0.01,
-#                  p_point_replace=0.05,
-#                  max_samples=1.0,
-#                  class_weight=None,
-#                  feature_names=None,
-#                  warm_start=False,
-#                  low_memory=False,
-#                  n_jobs=1,
-#                  verbose=0,
-#                  random_state=None):
-#         super(SymbolicClassifier, self).__init__(
-#             population_size=population_size,
-#             generations=generations,
-#             tournament_size=tournament_size,
-#             stopping_criteria=stopping_criteria,
-#             const_range=const_range,
-#             init_depth=init_depth,
-#             init_method=init_method,
-#             function_set=function_set,
-#             transformer=transformer,
-#             metric=metric,
-#             parsimony_coefficient=parsimony_coefficient,
-#             p_crossover=p_crossover,
-#             p_subtree_mutation=p_subtree_mutation,
-#             p_hoist_mutation=p_hoist_mutation,
-#             p_point_mutation=p_point_mutation,
-#             p_point_replace=p_point_replace,
-#             max_samples=max_samples,
-#             class_weight=class_weight,
-#             feature_names=feature_names,
-#             warm_start=warm_start,
-#             low_memory=low_memory,
-#             n_jobs=n_jobs,
-#             verbose=verbose,
-#             random_state=random_state)
-
-#     def __str__(self):
-#         """Overloads `print` output of the object to resemble a LISP tree."""
-#         if not hasattr(self, '_program'):
-#             return self.__repr__()
-#         return self._program.__str__()
-
-#     def _more_tags(self):
-#         return {'binary_only': True}
-
-#     def predict_proba(self, X):
-#         """Predict probabilities on vectors X. 
-
-#         Parameters
-#         ----------
-#         X : List[pd.DataFrame] or array-like of shape (n_features,
-#         n_days, n_firms) or (n_samples, n_features, n_days, n_firms)
-#             Input vectors, where n_samples is the number of samples,
-#             n_features is the number of features, n_days is sequence
-#             length of each sample, n_firms is number of firms / stocks.
-#             If provided as DataFrames, must have same index / columns, 
-#             with shape (n_days, n_firms).
-
-#         Returns
-#         -------
-#         y_prob : array-like of shape (n_samples, n_days, n_firms, n_classes)
-#             Target values, shape depends on return_2d argument.
-#         """
-#         if not hasattr(self, '_program'):
-#             raise NotFittedError('SymbolicClassifier not fitted.')
-
-#         X, _, _, _, _ = self._validate_data(X, None, None)
-#         n_features = X.shape[1]
-#         if self.n_features_in_ != n_features:
-#             raise ValueError('Number of features of the model must match the '
-#                              'input. Model n_features is %s and input '
-#                              'n_features is %s.'
-#                              % (self.n_features_in_, n_features))
-
-#         y = self._program.execute(X)
-#         if getattr(self, '_transformer', None) is None:
-#             warn('No transformer for result, use raw predict as-is.')
-#         else:
-#             y = self._transformer(y)
-#         y = np.stack([1.-y, y], axis=-1)
-#         return y
-
-#     def predict(self, X, return_2d=False):
-#         """Predict classes on test vectors X. If return_2d is set
-#         to True, return predict result in 2d array or DataFrame.
-
-#         Parameters
-#         ----------
-#         X : List[pd.DataFrame] or array-like of shape (n_features,
-#         n_days, n_firms) or (n_samples, n_features, n_days, n_firms)
-#             Input vectors, where n_samples is the number of samples,
-#             n_features is the number of features, n_days is sequence
-#             length of each sample, n_firms is number of firms / stocks.
-#             If provided as DataFrames, must have same index / columns, 
-#             with shape (n_days, n_firms).
-            
-#         return_2d : bool, default=False
-#             If set to True, will flatten n_samples dim and reshape to
-#             (n_samples*n_days, n_firms) with padded rows removed. If X
-#             is provided as DataFrames, also keep original index and
-#             columns. Finally, only probability for positive class is
-#             returned.
-
-#         Returns
-#         -------
-#         y : pd.DataFrame or array-like of shape (n_days, n_firms)
-#         or (n_samples, n_days, n_firms)
-#             Target values, shape depends on return_2d argument.
-
-#         """
-#         if not hasattr(self, '_program'):
-#             raise NotFittedError('SymbolicClassifier not fitted.')
-
-#         X, _, _, ind, col = self._validate_data(X, None, None)
-#         n_features = X.shape[1]
-#         if self.n_features_in_ != n_features:
-#             raise ValueError('Number of features of the model must match the '
-#                              'input. Model n_features is %s and input '
-#                              'n_features is %s.'
-#                              % (self.n_features_in_, n_features))
-
-#         y = self._program.execute(X)
-#         if getattr(self, '_transformer', None) is None:
-#             raise ValueError('Cannot find transformer for raw predict.')
-#         y = self._transformer(y)
-#         mask = np.isfinite(y)
-#         y = np.where(mask, y, 0.)
-#         y = np.stack([1.-y, y], axis=-1)
-#         y = self.classes_.take(np.argmax(y, axis=-1))
-#         missing = np.str_(np.nan) \
-#             if np.issubdtype(self.classes_.dtype, str) else np.nan
-#         y = np.where(mask, y, missing)
-#         if return_2d:
-#             if isinstance(ind, int):
-#                 y = y[0]
-#             elif isinstance(ind, pd.Index):
-#                 y = pd.DataFrame(y[0], index=ind, columns=col)
-#             else:
-#                 raise ValueError(f'Unsurpported index type '
-#                                    f'{type(ind)}, {type(col)}')
-#         return y
-
-
-# class SymbolicTransformer(BaseSymbolic, TransformerMixin):
-
-#     """A Genetic Programming symbolic transformer.
-
-#     A symbolic transformer is a supervised transformer that begins by building
-#     a population of naive random formulas to represent a relationship. The
-#     formulas are represented as tree-like structures with mathematical
-#     functions being recursively applied to variables and constants. Each
-#     successive generation of programs is then evolved from the one that came
-#     before it by selecting the fittest individuals from the population to
-#     undergo genetic operations such as crossover, mutation or reproduction.
-#     The final population is searched for the fittest individuals with the least
-#     correlation to one another.
-
-#     Parameters
-#     ----------
-#     population_size : integer, optional (default=1000)
-#         The number of programs in each generation.
-
-#     hall_of_fame : integer, or None, optional (default=100)
-#         The number of fittest programs to compare from when finding the
-#         least-correlated individuals for the n_components. If `None`, the
-#         entire final generation will be used.
-
-#     n_components : integer, or None, optional (default=10)
-#         The number of best programs to return after searching the hall_of_fame
-#         for the least-correlated individuals. If `None`, the entire
-#         hall_of_fame will be used.
-
-#     generations : integer, optional (default=20)
-#         The number of generations to evolve.
-
-#     tournament_size : integer, optional (default=20)
-#         The number of programs that will compete to become part of the next
-#         generation.
-
-#     stopping_criteria : float, optional (default=1.0)
-#         The required metric value required in order to stop evolution early.
-
-#     const_range : tuple of two floats, or None, optional (default=(-1., 1.))
-#         The range of constants to include in the formulas. If None then no
-#         constants will be included in the candidate programs.
-
-#     init_depth : tuple of two ints, optional (default=(2, 6))
-#         The range of tree depths for the initial population of naive formulas.
-#         Individual trees will randomly choose a maximum depth from this range.
-#         When combined with `init_method='half and half'` this yields the well-
-#         known 'ramped half and half' initialization method.
-
-#     init_method : str, optional (default='half and half')
-#         - 'grow' : Nodes are chosen at random from both functions and
-#           terminals, allowing for smaller trees than `init_depth` allows. Tends
-#           to grow asymmetrical trees.
-#         - 'full' : Functions are chosen until the `init_depth` is reached, and
-#           then terminals are selected. Tends to grow 'bushy' trees.
-#         - 'half and half' : Trees are grown through a 50/50 mix of 'full' and
-#           'grow', making for a mix of tree shapes in the initial population.
-
-#     function_set : iterable, optional (default=('add', 'sub', 'mul', 'div'))
-#         The functions to use when building and evolving programs. This iterable
-#         can include strings to indicate either individual functions as outlined
-#         below, or you can also include your own functions as built using the
-#         ``make_function`` factory from the ``functions`` module.
-
-#         Available individual functions are:
-
-#         - 'add' : addition, arity=2.
-#         - 'sub' : subtraction, arity=2.
-#         - 'mul' : multiplication, arity=2.
-#         - 'div' : protected division where a denominator near-zero returns 1.,
-#           arity=2.
-#         - 'sqrt' : protected square root where the absolute value of the
-#           argument is used, arity=1.
-#         - 'log' : protected log where the absolute value of the argument is
-#           used and a near-zero argument returns 0., arity=1.
-#         - 'abs' : absolute value, arity=1.
-#         - 'neg' : negative, arity=1.
-#         - 'inv' : protected inverse where a near-zero argument returns 0.,
-#           arity=1.
-#         - 'max' : maximum, arity=2.
-#         - 'min' : minimum, arity=2.
-#         - 'sin' : sine (radians), arity=1.
-#         - 'cos' : cosine (radians), arity=1.
-#         - 'tan' : tangent (radians), arity=1.
-
-#     metric : str, optional (default='pearson')
-#         The name of the raw fitness metric. Available options include:
-
-#         - 'pearson', for Pearson's product-moment correlation coefficient.
-#         - 'spearman' for Spearman's rank-order correlation coefficient.
-
-#     parsimony_coefficient : float or "auto", optional (default=0.001)
-#         This constant penalizes large programs by adjusting their fitness to
-#         be less favorable for selection. Larger values penalize the program
-#         more which can control the phenomenon known as 'bloat'. Bloat is when
-#         evolution is increasing the size of programs without a significant
-#         increase in fitness, which is costly for computation time and makes for
-#         a less understandable final result. This parameter may need to be tuned
-#         over successive runs.
-
-#         If "auto" the parsimony coefficient is recalculated for each generation
-#         using c = Cov(l,f)/Var( l), where Cov(l,f) is the covariance between
-#         program size l and program fitness f in the population, and Var(l) is
-#         the variance of program sizes.
-
-#     p_crossover : float, optional (default=0.9)
-#         The probability of performing crossover on a tournament winner.
-#         Crossover takes the winner of a tournament and selects a random subtree
-#         from it to be replaced. A second tournament is performed to find a
-#         donor. The donor also has a subtree selected at random and this is
-#         inserted into the original parent to form an offspring in the next
-#         generation.
-
-#     p_subtree_mutation : float, optional (default=0.01)
-#         The probability of performing subtree mutation on a tournament winner.
-#         Subtree mutation takes the winner of a tournament and selects a random
-#         subtree from it to be replaced. A donor subtree is generated at random
-#         and this is inserted into the original parent to form an offspring in
-#         the next generation.
-
-#     p_hoist_mutation : float, optional (default=0.01)
-#         The probability of performing hoist mutation on a tournament winner.
-#         Hoist mutation takes the winner of a tournament and selects a random
-#         subtree from it. A random subtree of that subtree is then selected
-#         and this is 'hoisted' into the original subtrees location to form an
-#         offspring in the next generation. This method helps to control bloat.
-
-#     p_point_mutation : float, optional (default=0.01)
-#         The probability of performing point mutation on a tournament winner.
-#         Point mutation takes the winner of a tournament and selects random
-#         nodes from it to be replaced. Terminals are replaced by other terminals
-#         and functions are replaced by other functions that require the same
-#         number of arguments as the original node. The resulting tree forms an
-#         offspring in the next generation.
-
-#         Note : The above genetic operation probabilities must sum to less than
-#         one. The balance of probability is assigned to 'reproduction', where a
-#         tournament winner is cloned and enters the next generation unmodified.
-
-#     p_point_replace : float, optional (default=0.05)
-#         For point mutation only, the probability that any given node will be
-#         mutated.
-
-#     max_samples : float, optional (default=1.0)
-#         The fraction of samples to draw from X to evaluate each program on.
-
-#     feature_names : list, optional (default=None)
-#         Optional list of feature names, used purely for representations in
-#         the `print` operation or `export_graphviz`. If None, then X0, X1, etc
-#         will be used for representations.
-
-#     warm_start : bool, optional (default=False)
-#         When set to ``True``, reuse the solution of the previous call to fit
-#         and add more generations to the evolution, otherwise, just fit a new
-#         evolution.
-
-#     low_memory : bool, optional (default=False)
-#         When set to ``True``, only the current generation is retained. Parent
-#         information is discarded. For very large populations or runs with many
-#         generations, this can result in substantial memory use reduction.
-
-#     n_jobs : integer, optional (default=1)
-#         The number of jobs to run in parallel for `fit`. If -1, then the number
-#         of jobs is set to the number of cores.
-
-#     verbose : int, optional (default=0)
-#         Controls the verbosity of the evolution building process.
-
-#     random_state : int, RandomState instance or None, optional (default=None)
-#         If int, random_state is the seed used by the random number generator;
-#         If RandomState instance, random_state is the random number generator;
-#         If None, the random number generator is the RandomState instance used
-#         by `np.random`.
-
-#     Attributes
-#     ----------
-#     run_details_ : dict
-#         Details of the evolution process. Includes the following elements:
-
-#         - 'generation' : The generation index.
-#         - 'average_length' : The average program length of the generation.
-#         - 'average_fitness' : The average program fitness of the generation.
-#         - 'best_length' : The length of the best program in the generation.
-#         - 'best_fitness' : The fitness of the best program in the generation.
-#         - 'best_oob_fitness' : The out of bag fitness of the best program in
-#           the generation (requires `max_samples` < 1.0).
-#         - 'generation_time' : The time it took for the generation to evolve.
-
-#     See Also
-#     --------
-#     SymbolicRegressor
-
-#     References
-#     ----------
-#     .. [1] J. Koza, "Genetic Programming", 1992.
-
-#     .. [2] R. Poli, et al. "A Field Guide to Genetic Programming", 2008.
-
-#     """
-
-#     def __init__(self,
-#                  *,
-#                  population_size=1000,
-#                  hall_of_fame=100,
-#                  n_components=10,
-#                  generations=20,
-#                  tournament_size=20,
-#                  stopping_criteria=1.0,
-#                  const_range=(-1., 1.),
-#                  init_depth=(2, 6),
-#                  init_method='half and half',
-#                  function_set=('add', 'sub', 'mul', 'div'),
-#                  metric='pearson',
-#                  parsimony_coefficient=0.001,
-#                  p_crossover=0.9,
-#                  p_subtree_mutation=0.01,
-#                  p_hoist_mutation=0.01,
-#                  p_point_mutation=0.01,
-#                  p_point_replace=0.05,
-#                  max_samples=1.0,
-#                  feature_names=None,
-#                  warm_start=False,
-#                  low_memory=False,
-#                  n_jobs=1,
-#                  verbose=0,
-#                  random_state=None):
-#         super(SymbolicTransformer, self).__init__(
-#             population_size=population_size,
-#             hall_of_fame=hall_of_fame,
-#             n_components=n_components,
-#             generations=generations,
-#             tournament_size=tournament_size,
-#             stopping_criteria=stopping_criteria,
-#             const_range=const_range,
-#             init_depth=init_depth,
-#             init_method=init_method,
-#             function_set=function_set,
-#             metric=metric,
-#             parsimony_coefficient=parsimony_coefficient,
-#             p_crossover=p_crossover,
-#             p_subtree_mutation=p_subtree_mutation,
-#             p_hoist_mutation=p_hoist_mutation,
-#             p_point_mutation=p_point_mutation,
-#             p_point_replace=p_point_replace,
-#             max_samples=max_samples,
-#             feature_names=feature_names,
-#             warm_start=warm_start,
-#             low_memory=low_memory,
-#             n_jobs=n_jobs,
-#             verbose=verbose,
-#             random_state=random_state)
-
-#     def __len__(self):
-#         """Overloads `len` output to be the number of fitted components."""
-#         if not hasattr(self, '_best_programs'):
-#             return 0
-#         return self.n_components
-
-#     def __getitem__(self, item):
-#         """Return the ith item of the fitted components."""
-#         if item >= len(self):
-#             raise IndexError
-#         return self._best_programs[item]
-
-#     def __str__(self):
-#         """Overloads `print` output of the object to resemble LISP trees."""
-#         if not hasattr(self, '_best_programs'):
-#             return self.__repr__()
-#         output = str([gp.__str__() for gp in self])
-#         return output.replace("',", ",\n").replace("'", "")
-
-#     def _more_tags(self):
-#         return {
-#             "_xfail_checks": {
-#                 "check_sample_weights_invariance": (
-#                     "zero sample_weight is not equivalent to removing samples"
-#                 ),
-#             }
-#         }
-
-#     def transform(self, X):
-#         """Transform X according to the fitted transformer.
-
-#         Parameters
-#         ----------
-#         X : array-like, shape = [n_samples, n_features]
-#             Input vectors, where n_samples is the number of samples
-#             and n_features is the number of features.
-
-#         Returns
-#         -------
-#         X_new : array-like, shape = [n_samples, n_components]
-#             Transformed array.
-
-#         """
-#         if not hasattr(self, '_best_programs'):
-#             raise NotFittedError('SymbolicTransformer not fitted.')
-#         X = check_array(X, allow_nd=True, force_all_finite='allow-nan')
-#         _, n_features = X.shape[:2]
-#         if self.n_features_in_ != n_features:
-#             raise ValueError('Number of features of the model must match the '
-#                              'input. Model n_features is %s and input '
-#                              'n_features is %s.'
-#                              % (self.n_features_in_, n_features))
-
-#         X_new = np.array([gp.execute(X) for gp in self._best_programs]).T
-
-#         return X_new
-
-#     def fit_transform(self, X, y, sample_weight=None):
-#         """Fit to data, then transform it.
-
-#         Parameters
-#         ----------
-#         X : array-like, shape = [n_samples, n_features]
-#             Training vectors, where n_samples is the number of samples and
-#             n_features is the number of features.
-
-#         y : array-like, shape = [n_samples]
-#             Target values.
-
-#         sample_weight : array-like, shape = [n_samples], optional
-#             Weights applied to individual samples.
-
-#         Returns
-#         -------
-#         X_new : array-like, shape = [n_samples, n_components]
-#             Transformed array.
-
-#         """
-#         return self.fit(X, y, sample_weight).transform(X)

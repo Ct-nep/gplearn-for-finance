@@ -78,16 +78,16 @@ class _Program(object):
         The reason for this being passed is that during parallel evolution the
         same program object may be accessed by multiple parallel processes.
 
-    transformer : _Function object, optional (default=None)
+    transformer : _Function object, optional, default = None
         The function to transform the output of the program to probabilities,
         only used for the SymbolicClassifier.
 
-    feature_names : list, optional (default=None)
+    feature_names : list, optional, default = None
         Optional list of feature names, used purely for representations in
         the `print` operation or `export_graphviz`. If None, then X0, X1, etc
         will be used for representations.
 
-    program : list, optional (default=None)
+    program : list, optional, default = None
         The flattened tree representation of the program. If None, a new naive
         random tree will be grown. If provided, it will be validated.
 
@@ -102,10 +102,10 @@ class _Program(object):
     fitness_ : float
         The penalized fitness of the individual program.
 
-    oob_fitness_ : float
-        The out-of-bag raw fitness of the individual program for the held-out
-        samples. Only present when sub-sampling was used in the estimator by
-        specifying `max_samples` < 1.0.
+    os_fitness_ : float
+        The out-of-sample raw fitness of the individual program for the
+        held-out samples. Only present when IS split was used in the
+        estimator by specifying `is_split` < 1.0.
 
     parents : dict, or None
         If None, this is a naive random program from the initial population.
@@ -162,7 +162,7 @@ class _Program(object):
         self.fitness_ = None
         self.parents = None
         self._n_samples = None
-        self._max_samples = None
+        self._is_split = None
         self._indices_state = None
 
     def build_program(self, random_state):
@@ -358,13 +358,13 @@ class _Program(object):
 
         Parameters
         ----------
-        X : array-like, shape = (n_days, n_features, n_firms)
-            Training vectors, where n_days is the number of samples and
-            n_features is the number of features.
+        X : array-like, shape = (n_samples, n_features, n_firms)
+            Training vectors, where n_samples is the number of samples
+            and n_features is the number of features.
 
         Returns
         -------
-        y_hats : array-like, shape = (n_days, n_firms)
+        y_hats : array-like, shape = (n_samples, n_firms)
             The result of executing the program on X.
 
         """
@@ -394,7 +394,7 @@ class _Program(object):
                 terminals = [np.full_like(X[:, 0], t, dtype=float) \
                     if isinstance(t, float) \
                     else X[:, t] if isinstance(t, int) \
-                    else t[0] for t in apply_stack[-1][1:]]
+                    else t for t, _ in apply_stack[-1][1:]]
                 intermediate_result = function(param, *terminals)
                 if len(apply_stack) != 1:
                     apply_stack.pop()
@@ -405,8 +405,7 @@ class _Program(object):
         # We should never get here
         return None
 
-    def get_all_indices(self, n_samples=None, max_samples=None,
-                        random_state=None):
+    def get_all_indices(self, n_samples=None, is_split=None):
         """Get the indices on which to evaluate the fitness of a program.
 
         Parameters
@@ -414,41 +413,29 @@ class _Program(object):
         n_samples : int
             The number of samples.
 
-        max_samples : int
-            The maximum number of samples to use.
+        is_split : int
+            The first n samples used to evaluate in-sample fitness.
 
         random_state : RandomState instance
             The random number generator.
 
         Returns
         -------
-        indices : array-like, shape = [n_samples]
+        indices : array-like, shape = (n_samples,)
             The in-sample indices.
 
-        not_indices : array-like, shape = [n_samples]
+        not_indices : array-like, shape = (n_samples,)
             The out-of-sample indices.
 
         """
-        if self._indices_state is None and random_state is None:
-            raise ValueError('The program has not been evaluated for fitness '
-                             'yet, indices not available.')
-
         if n_samples is not None and self._n_samples is None:
             self._n_samples = n_samples
-        if max_samples is not None and self._max_samples is None:
-            self._max_samples = max_samples
-        if random_state is not None and self._indices_state is None:
-            self._indices_state = random_state.get_state()
-
-        indices_state = check_random_state(None)
-        indices_state.set_state(self._indices_state)
-
-        not_indices = sample_without_replacement(
-            self._n_samples,
-            self._n_samples - self._max_samples,
-            random_state=indices_state)
-        sample_counts = np.bincount(not_indices, minlength=self._n_samples)
-        indices = np.where(sample_counts == 0)[0]
+        if is_split is not None and self._is_split is None:
+            self._is_split = is_split
+        
+        indices = np.arange(n_samples)
+        not_indices = indices[indices >= is_split]
+        indices = indices[indices < is_split]
 
         return indices, not_indices
 
@@ -461,33 +448,33 @@ class _Program(object):
         X: np.ndarray, 
         y: np.ndarray, 
         sample_weight: np.ndarray, 
-        additional_data: Dict[str, np.ndarray],
+        trans_args: Dict[str, np.ndarray],
         return_pnl=False,
     ) -> Union[float, Tuple]:
         """Evaluate the raw fitness of the program according to X, y.
 
         Parameters
         ----------
-        X : array-like, shape = (n_days, n_features, n_firms)
-            Training vectors, where n_days is the number of sample days
-            and n_features is the number of features.
+        X : array-like, shape = (n_samples, n_features, n_firms)
+            Training vectors, where n_samples is the number of sample
+            days and n_features is the number of features.
 
-        y : array-like, shape = (n_days, n_firms)
+        y : array-like, shape = (n_samples, n_firms)
             Target values, e.g. DELAY0 returns for DELAYED features.
 
-        sample_weight : array-like, shape = (n_days, n_firms)
+        sample_weight : array-like, shape = (n_samples, n_firms)
             Weights applied to individual samples.
             
-        additional_data : dict of array-like
+        trans_args : dict of array-like
             Additional information received from fit() call, can be
             universe and industry classification etc. to help repair and
             validate weights. Require a customized transform function to
             tell how it works when creating GP instance.
             
-        return_pnl : optional, bool, default=False
+        return_pnl : bool, optional, default = False
             If set to True, function will return a 2-element-tuple
             (fitness, pnl), where pnl is daily portfolio return at each
-            sample day in shape (n_days,).
+            sample day in shape (n_samples,).
 
         Returns
         -------
@@ -496,7 +483,9 @@ class _Program(object):
         """
         y_pred = self.execute(X)
         if self.transformer is not None:
-            y_pred = self.transformer(y_pred, additional_data)
+            # transformer is _Function instance which is expected to
+            # have a null param.
+            y_pred = self.transformer(None, y_pred, trans_args)
         raw_fitness = self.metric(y, y_pred, sample_weight)
         if return_pnl:
             return raw_fitness, np.nansum(y_pred*y, axis=1)
@@ -530,7 +519,7 @@ class _Program(object):
         random_state : RandomState instance
             The random number generator.
 
-        program : list, optional (default=None)
+        program : list, optional, default = None
             The flattened tree representation of the program. If None, the
             embedded tree in the object will be used.
 

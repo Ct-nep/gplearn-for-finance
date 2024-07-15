@@ -42,7 +42,7 @@ class _Function(object):
         self.function = function
         self.name = name
         self.arity = arity
-        self.valid_range = tuple()
+        self.valid_range = (None,)
 
     def __call__(self, param, *args):
         return self.function(*args)
@@ -76,6 +76,8 @@ class _TSFunction(_Function):
     """
     def __init__(self, function, name, arity, valid_range):
         super().__init__(function, name, arity)
+        assert isinstance(valid_range, Iterable) and len(valid_range), \
+            f'Invalid range: {valid_range}'
         self.valid_range = valid_range
     
     def __call__(self, param, *args):
@@ -131,7 +133,7 @@ def make_function(*, function, name, arity, wrap=True):
                      name=name,
                      arity=arity)
     
-def make_ts_function(*, function, name, arity, date_range, wrap=True):
+def make_ts_function(*, function, name, arity, valid_range, wrap=True):
     """Make a time-series variant of function, _TSFunction instance.
 
     Parameters
@@ -147,7 +149,7 @@ def make_ts_function(*, function, name, arity, date_range, wrap=True):
     arity : int
         The number of arguments that the `function` takes.
         
-    date_range : list-like
+    valid_range : list-like
         A Iterable where each element is a valid option of lookback
         window length. During evolution, phenotypes will call this
         function with lookback initialized / mutated / passed by parents
@@ -165,27 +167,28 @@ def make_ts_function(*, function, name, arity, date_range, wrap=True):
     if not isinstance(arity, int):
         raise ValueError('arity must be an int, got %s' % type(arity))
     if not isinstance(function, np.ufunc):
-        if function.__code__.co_argcount != arity:
+        if function.__code__.co_argcount-1 != arity:
             raise ValueError('arity %d does not match required number of '
                              'function arguments of %d.'
-                             % (arity, function.__code__.co_argcount))
+                             % (arity, function.__code__.co_argcount-1))
     if not isinstance(name, str):
         raise ValueError('name must be a string, got %s' % type(name))
     if not isinstance(wrap, bool):
         raise ValueError('wrap must be an bool, got %s' % type(wrap))
-    if not isinstance(date_range, Iterable) \
-        or not all([np.issubdtype(type(i), int) for i in date_range]):
+    if not isinstance(valid_range, Iterable) \
+        or not all([np.issubdtype(type(i), int) for i in valid_range]):
         raise ValueError('date_range must be Iterable with integers.')
     if wrap:
         return _TSFunction(function=wrap_non_picklable_objects(function), 
-                           name=name, arity=arity, date_range=date_range)
+                           name=name, arity=arity, valid_range=valid_range)
     return _TSFunction(function=function, name=name, arity=arity, 
-                       date_range=date_range)
+                       valid_range=valid_range)
 
 def _protected_division(x1, x2):
     """Closure of division (x1/x2) for zero denominator."""
     with np.errstate(divide='ignore', invalid='ignore'):
-        return np.where(np.abs(x2) > 1e-15, np.divide(x1, x2), 1.)
+        res = np.divide(x1, x2)
+        return np.where(np.isfinite(res), res, np.nan)
 
 
 def _protected_sqrt(x1):
