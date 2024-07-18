@@ -11,7 +11,7 @@ computer programs.
 
 import itertools
 from abc import ABCMeta, abstractmethod
-from collections import Iterable
+from collections import Iterable, Callable
 from copy import copy
 from time import time
 from warnings import warn
@@ -49,6 +49,7 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight,
     arities = params['arities']
     init_depth = params['init_depth']
     init_method = params['init_method']
+    p_grow_terminal = params['p_grow_terminal']
     const_range = params['const_range']
     metric = params['_metric']
     transformer = params['_transformer']
@@ -128,6 +129,7 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight,
                            metric=metric,
                            transformer=transformer,
                            const_range=const_range,
+                           p_grow_terminal=p_grow_terminal,
                            p_point_replace=p_point_replace,
                            parsimony_coefficient=parsimony_coefficient,
                            feature_names=feature_names,
@@ -209,6 +211,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                  transformer=None,
                  metric='mean absolute error',
                  parsimony_coefficient=0.001,
+                 p_grow_terminal=0.1,
                  p_crossover=0.9,
                  p_subtree_mutation=0.01,
                  p_hoist_mutation=0.01,
@@ -217,13 +220,13 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                  elitism=1,
                  variety='corr',
                  is_split=1.0,
-                 sample_days=None,
                  class_weight=None,
                  feature_names=None,
                  warm_start=False,
                  low_memory=False,
                  n_jobs=1,
                  verbose=0,
+                 callbacks=None,
                  random_state=None):
         self.population_size = population_size
         self.hall_of_fame = hall_of_fame
@@ -238,6 +241,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         self.transformer = transformer
         self.metric = metric
         self.parsimony_coefficient = parsimony_coefficient
+        self.p_grow_terminal = p_grow_terminal
         self.p_crossover = p_crossover
         self.p_subtree_mutation = p_subtree_mutation
         self.p_hoist_mutation = p_hoist_mutation
@@ -246,13 +250,13 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         self.elitism = elitism
         self.variety = variety
         self.is_split = is_split
-        self.sample_days = sample_days
         self.class_weight = class_weight
         self.feature_names = feature_names
         self.warm_start = warm_start
         self.low_memory = low_memory
         self.n_jobs = n_jobs
         self.verbose = verbose
+        self.callbacks = callbacks
         self.random_state = random_state
 
     def _verbose_reporter(self, run_details=None):
@@ -285,11 +289,11 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
 
             os_fitness = 'N/A'
             line_format = \
-                '{:4d} {:8.2f} {:8.4f} {:8g} {:8d} {:8g} {:>8} {:>10}'
+                '{:4d} {:8.2f} {:8.3f} {:8.4f} {:8d} {:8.4f} {:>8} {:>10}'
             if self.is_split < 1.0:
                 os_fitness = run_details['best_os_fitness'][-1]
-                line_format = \
-                    '{:4d} {:8.2f} {:8.4f} {:8g} {:8d} {:8g} {:8g} {:>10}'
+                line_format =  '{:4d} {:8.2f} {:8.2f} {:8.4f} {:8d} '\
+                    '{:8.4f} {:8.4f} {:>10}'
 
             print(line_format.format(run_details['generation'][-1],
                                      run_details['average_length'][-1],
@@ -302,21 +306,20 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
     
     def _validate_data(self, X, y, sample_weight, trans_args, fit=False):
         '''Patch parent's _validate_data() method for 3-dim situation.
-        Due to drastic change of behavior, it is no long suitable to
-        rely on sklearn's validate method.
+        Due to drastic change of behavior, it is no long suitable to rely on
+        sklearn's validate method.
         
-        Support inputs of multiple DataFrame as X and single DataFrame
-        as y. If this is the case, convert them to ndarray and preserve
-        index / columns info.
+        Support inputs of multiple DataFrame as X and single DataFrame as y. If
+        this is the case, convert them to ndarray and preserve index / columns
+        info.
         
         Parameters
         ----------
-        X : List[pd.DataFrame] or array-like, shape = (n_samples,
-        n_features, n_firms)
+        X : List[pd.DataFrame] or array-like, shape = (n_samples, n_features,
+        n_firms)
             See self.fit().
 
-        y : None or pd.DataFrame or array-like, shape = (n_samples,
-        n_firms)
+        y : None or pd.DataFrame or array-like, shape = (n_samples, n_firms)
             See self.fit().
 
         sample_weight : None or pd.DataFrame or array-like, shape =
@@ -326,15 +329,15 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             See self.fit().
             
         fit : bool, default=False
-            If set to True, overwrite regressor with inputs' feature
-            number and names, otherwise only check if they match with
-            previous call of fit.
+            If set to True, overwrite regressor with inputs' feature number and
+            names, otherwise only check if they match with previous call of
+            fit.
 
         Returns
         -------
         out : tuple
-            All input data converted to correct dtype and shape, plus
-            index and columns info.
+            All input data converted to correct dtype and shape, plus index and
+            columns info.
         '''
         idx, col = None, None
         if y is None and sample_weight is not None:
@@ -416,6 +419,95 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                                     f'int-like float, received {y.dtype}.')
         return (X, y, sample_weight, trans_args, idx, col)
     
+    def get_params(self, deep=True, raw=False):
+        '''Override BaseEstimator function to correctly validate & pass
+        arguments required in ``fit``.
+        
+        Parameters
+        --------
+        deep : bool, optional, default = True
+            If True, make deep copy of sub-Estimator object in the param dict.
+            
+        raw : bool, optional, default = False
+            If True, return params in ``__init__`` signature as-is, which is
+            expected by callbacks.
+            
+        Returns
+        --------
+        params : dict
+            Param dict with critical params readily usable in evolution.
+        '''
+        params = super().get_params(deep)
+        if raw:
+            return params
+        
+        if isinstance(self.metric, _Fitness):
+            self._metric = self.metric
+        elif isinstance(self, RegressorMixin):
+            if self.metric not in ('mean absolute error', 'mse', 'rmse',
+                                   'pearson', 'spearman'):
+                raise ValueError('Unsupported metric: %s' % self.metric)
+            self._metric = _fitness_map[self.metric]
+        self._function_set = []
+        for function in self.function_set:
+            if isinstance(function, str):
+                if function not in _function_map:
+                    raise ValueError('invalid function name %s found in '
+                                     '`function_set`.' % function)
+                self._function_set.append(_function_map[function])
+            elif isinstance(function, _Function):
+                self._function_set.append(function)
+            else:
+                raise ValueError('invalid type %s found in `function_set`.'
+                                 % type(function))
+        if not self._function_set:
+            raise ValueError('No valid functions found in `function_set`.')
+        # For point-mutation to find a compatible replacement node
+        self._arities = {}
+        for function in self._function_set:
+            arity = function.arity
+            self._arities[arity] = self._arities.get(arity, [])
+            self._arities[arity].append(function)
+        self._method_probs = np.array([self.p_crossover,
+                                       self.p_subtree_mutation,
+                                       self.p_hoist_mutation,
+                                       self.p_point_mutation])
+        self._method_probs = np.cumsum(self._method_probs)
+        if self._method_probs[-1] > 1:
+            raise ValueError('The sum of p_crossover, p_subtree_mutation, '
+                             'p_hoist_mutation and p_point_mutation should '
+                             'total to 1.0 or less.')
+        if self.transformer is not None:
+            if isinstance(self.transformer, _Function):
+                self._transformer = self.transformer
+            else:
+                raise ValueError('Invalid `transformer`. Expected _Function '
+                                 'object, got %s' % type(self.transformer))
+            if self._transformer.arity != 2:
+                raise ValueError('Invalid arity for `transformer`. Expected 2,'
+                                 ' got %d.' % (self._transformer.arity))
+        if isinstance(self.elitism, float):
+            if not 0. < self.elitism < 1.:
+                raise ValueError(f'Elitism ratio must in range (0., 1.), '
+                                 f'got {self.elitism}')
+            self.elitism = int(self.elitism * self.population_size)
+        elif self.elitism is None:
+            self.elitism = 0
+        if not 0 <= self.elitism < self.population_size:
+            raise ValueError(f'Elitism number of genotypes must in range '
+                             f'[0, population_size), got {self.elitism}')
+        
+        params['_metric'] = self._metric
+        params['function_set'] = self._function_set
+        params['arities'] = self._arities
+        params['method_probs'] = self._method_probs
+        if hasattr(self, '_transformer'):
+            params['_transformer'] = self._transformer
+        else:
+            params['_transformer'] = None
+        params['return_pnl'] = self.variety == 'corr'
+        return params
+    
     def fit(
         self, 
         X: Union[List[pd.DataFrame], np.ndarray], 
@@ -427,51 +519,49 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
 
         Parameters
         ----------
-        X : List[pd.DataFrame] or array-like, shape = (n_samples,
-        n_features, n_firms)
-            Training vectors, where n_samples is the number of trading
-            days as samples, n_features is the number of features,
-            n_firms is number of firms / stocks.  If provided as
-            DataFrames, must have same index / columns, with shape
-            (n_samples, n_firms).
+        X : List[pd.DataFrame] or array-like, shape = (n_samples, n_features,
+        n_firms)
+            Training vectors, where n_samples is the number of trading days as
+            samples, n_features is the number of features, n_firms is number of
+            firms / stocks.  If provided as DataFrames, must have same index /
+            columns, with shape (n_samples, n_firms).
 
         y : None, pd.DataFrame or array-like, shape = (n_samples, n_firms)
-            Target values, if provided as DataFrame, must have same
-            index / columns with all X DataFrame, with shape (n_samples,
-            n_firms).
+            Target values, if provided as DataFrame, must have same index /
+            columns with all X DataFrame, with shape (n_samples, n_firms).
 
         sample_weight : None or pd.DataFrame or array-like, shape =
         (n_samples,) or (n_samples, n_firms), optional, default = None
-            Weights applied to individual samples. Will be broadcast to
-            2d if supplied as 1d array / Series.
+            Weights applied to individual samples. Will be broadcast to 2d if
+            supplied as 1d array / Series.
             
         trans_args : None or dict, optional, default = None
             Additional information like instrument universe, industry
             classification etc. If provided, will be passed to fitness
-            evaluation function. The method only check shape of these
-            data, since it does not know what more to be expected.
+            evaluation function. The method only check shape of these data,
+            since it does not know what more to be expected.
 
         Returns
         -------
         self : object
             Returns self.
         """
-        if self.sample_days is not None and \
-            (not isinstance(self.sample_days, int) or self.sample_days <= 0):
-            raise ValueError('sample_days must be positive integer.')
-        if isinstance(self.elitism, float):
-            if not 0. < self.elitism < 1.:
-                raise ValueError(f'Elitism ratio must in range (0., 1.), '
-                                 f'got {self.elitism}')
-            self.elitism = int(self.elitism * self.population_size)
-        elif self.elitism is None:
-            self.elitism = 0
-        if not 0 <= self.elitism < self.population_size:
-            raise ValueError(f'Elitism number of genotypes must in range '
-                             f'[0, population_size), got {self.elitism}')
-        if self.variety not in [None, 'corr', 'unique']:
+        if self.variety not in [None, 'corr', 'fitness']:
             raise ValueError(f'Expect variety in [None, "corr", "fitness"], '
                              f'got {self.variety}')
+        if not 0 < self.p_grow_terminal < 1:
+            raise ValueError(f'p_grow_terminal must in range (0., 1.), '
+                             f'got {self.p_grow_terminal}')
+        if self.callbacks is not None:
+            if isinstance(self.callbacks, Callable):
+                self.callbacks = [self.callbacks]
+            elif isinstance(self.callbacks, Iterable):
+                if not all([isinstance(i, Callable) for i in self.callbacks]):
+                    raise ValueError('callbacks sequence has '
+                                     'non-callable object.')
+            else:
+                raise ValueError('callbacks must be callable, '
+                                     'or list of callable.')
 
         random_state = check_random_state(self.random_state)
         X, y, sample_weight, trans_args, _, _ = \
@@ -512,54 +602,21 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                              'hall_of_fame (%d).' % (self.n_components,
                                                      self.hall_of_fame))
 
-        self._function_set = []
-        for function in self.function_set:
-            if isinstance(function, str):
-                if function not in _function_map:
-                    raise ValueError('invalid function name %s found in '
-                                     '`function_set`.' % function)
-                self._function_set.append(_function_map[function])
-            elif isinstance(function, _Function):
-                self._function_set.append(function)
-            else:
-                raise ValueError('invalid type %s found in `function_set`.'
-                                 % type(function))
-        if not self._function_set:
-            raise ValueError('No valid functions found in `function_set`.')
-
-        # For point-mutation to find a compatible replacement node
-        self._arities = {}
-        for function in self._function_set:
-            arity = function.arity
-            self._arities[arity] = self._arities.get(arity, [])
-            self._arities[arity].append(function)
-
-        if isinstance(self.metric, _Fitness):
-            self._metric = self.metric
-        elif isinstance(self, RegressorMixin):
-            if self.metric not in ('mean absolute error', 'mse', 'rmse',
-                                   'pearson', 'spearman'):
-                raise ValueError('Unsupported metric: %s' % self.metric)
-            self._metric = _fitness_map[self.metric]
-        elif isinstance(self, ClassifierMixin):
-            if self.metric != 'log loss':
-                raise ValueError('Unsupported metric: %s' % self.metric)
-            self._metric = _fitness_map[self.metric]
-        elif isinstance(self, TransformerMixin):
-            if self.metric not in ('pearson', 'spearman'):
-                raise ValueError('Unsupported metric: %s' % self.metric)
-            self._metric = _fitness_map[self.metric]
-
-        self._method_probs = np.array([self.p_crossover,
-                                       self.p_subtree_mutation,
-                                       self.p_hoist_mutation,
-                                       self.p_point_mutation])
-        self._method_probs = np.cumsum(self._method_probs)
-
-        if self._method_probs[-1] > 1:
-            raise ValueError('The sum of p_crossover, p_subtree_mutation, '
-                             'p_hoist_mutation and p_point_mutation should '
-                             'total to 1.0 or less.')
+        # if isinstance(self.metric, _Fitness):
+        #     self._metric = self.metric
+        # elif isinstance(self, RegressorMixin):
+        #     if self.metric not in ('mean absolute error', 'mse', 'rmse',
+        #                            'pearson', 'spearman'):
+        #         raise ValueError('Unsupported metric: %s' % self.metric)
+        #     self._metric = _fitness_map[self.metric]
+        # elif isinstance(self, ClassifierMixin):
+        #     if self.metric != 'log loss':
+        #         raise ValueError('Unsupported metric: %s' % self.metric)
+        #     self._metric = _fitness_map[self.metric]
+        # elif isinstance(self, TransformerMixin):
+        #     if self.metric not in ('pearson', 'spearman'):
+        #         raise ValueError('Unsupported metric: %s' % self.metric)
+        #     self._metric = _fitness_map[self.metric]
 
         if self.init_method not in ('half and half', 'grow', 'full'):
             raise ValueError('Valid program initializations methods include '
@@ -588,30 +645,6 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                 if not isinstance(feature_name, str):
                     raise ValueError('invalid type %s found in '
                                      '`feature_names`.' % type(feature_name))
-
-        if self.transformer is not None:
-            if isinstance(self.transformer, _Function):
-                self._transformer = self.transformer
-            # elif self.transformer == 'sigmoid':
-            #     self._transformer = sigmoid
-            else:
-                raise ValueError('Invalid `transformer`. Expected either '
-                                 '"sigmoid" or _Function object, got %s' %
-                                 type(self.transformer))
-            if self._transformer.arity != 2:
-                raise ValueError('Invalid arity for `transformer`. Expected 2, '
-                                 'got %d.' % (self._transformer.arity))
-
-        params = self.get_params()
-        params['_metric'] = self._metric
-        if hasattr(self, '_transformer'):
-            params['_transformer'] = self._transformer
-        else:
-            params['_transformer'] = None
-        params['function_set'] = self._function_set
-        params['arities'] = self._arities
-        params['method_probs'] = self._method_probs
-        params['return_pnl'] = self.variety == 'corr'
 
         if not self.warm_start or not hasattr(self, '_programs'):
             # Free allocated memory, if any
@@ -652,7 +685,8 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         for gen in range(prior_generations, self.generations):
 
             start_time = time()
-
+            params = self.get_params()
+            
             if gen == 0:
                 parents = None
             else:
@@ -678,8 +712,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             # Reduce, maintaining order across different n_jobs
             population = list(itertools.chain.from_iterable(population))
 
-            fitness = np.array([program.raw_fitness_ 
-                                for program in population])
+            fitness = [program.raw_fitness_ for program in population]
             length = [program.length_ for program in population]
             
             # Apply elitism to preserve (near unique) best performers in
@@ -734,6 +767,11 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             elif gen > 0:
                 # Remove old generations
                 self._programs[gen - 1] = None
+            # Always remove cached PNL.
+            if self.variety == 'corr' and gen > 0 and self._programs[gen-1]:
+                for program in self._programs[gen-1]:
+                    if hasattr(program, '_pnl'):
+                        program._pnl = None
                 
             # Calculate population variety:
             #  - Method 'fitness' uses a non-parametric estimation of
@@ -747,15 +785,17 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             #  - Method None leaves variety as NaN.
             variety = np.nan
             if self.variety == 'fitness':
-                minimum, maximum = fitness.min(), fitness.max()
-                if minimum == maximum:
-                    variety = 0.
+                temp = np.unique(fitness)
+                if len(temp) < 10:
+                    variety = np.nan
                 else:
+                    minimum, maximum = temp[1], temp[-2]
+                    temp = np.clip(fitness, minimum, maximum)
                     bins = np.linspace(minimum, maximum+1e-9, 10)
                     bins = np.digitize(fitness, bins)
                     _, count = np.unique(bins, return_counts=True)
-                    count /= len(fitness)
-                    variety = np.nansum(count * np.log(count)) / np.log(10.)
+                    count = count / len(fitness)
+                    variety = -np.nansum(count * np.log(count)) / np.log(10.)
             elif self.variety == 'corr':
                 corr = np.stack([program._pnl for program in population], 
                                axis=1)
@@ -793,45 +833,49 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                 best_fitness = fitness[np.argmin(fitness)]
                 if best_fitness <= self.stopping_criteria:
                     break
+                
+            if self.callbacks is not None:
+                for fn in self.callbacks:
+                    fn(self)
 
-        if isinstance(self, TransformerMixin):
-            # Find the best individuals in the final generation
-            fitness = np.array(fitness)
-            if self._metric.greater_is_better:
-                hall_of_fame = fitness.argsort()[::-1][:self.hall_of_fame]
-            else:
-                hall_of_fame = fitness.argsort()[:self.hall_of_fame]
-            evaluation = np.array([gp.execute(X) for gp in
-                                   [self._programs[-1][i] for
-                                    i in hall_of_fame]])
-            if self.metric == 'spearman':
-                evaluation = np.apply_along_axis(rankdata, 1, evaluation)
+        # if isinstance(self, TransformerMixin):
+        #     # Find the best individuals in the final generation
+        #     fitness = np.array(fitness)
+        #     if self._metric.greater_is_better:
+        #         hall_of_fame = fitness.argsort()[::-1][:self.hall_of_fame]
+        #     else:
+        #         hall_of_fame = fitness.argsort()[:self.hall_of_fame]
+        #     evaluation = np.array([gp.execute(X) for gp in
+        #                            [self._programs[-1][i] for
+        #                             i in hall_of_fame]])
+        #     if self.metric == 'spearman':
+        #         evaluation = np.apply_along_axis(rankdata, 1, evaluation)
 
-            with np.errstate(divide='ignore', invalid='ignore'):
-                correlations = np.abs(np.corrcoef(evaluation))
-            np.fill_diagonal(correlations, 0.)
-            components = list(range(self.hall_of_fame))
-            indices = list(range(self.hall_of_fame))
-            # Iteratively remove least fit individual of most correlated pair
-            while len(components) > self.n_components:
-                most_correlated = np.unravel_index(np.argmax(correlations),
-                                                   correlations.shape)
-                # The correlation matrix is sorted by fitness, so identifying
-                # the least fit of the pair is simply getting the higher index
-                worst = max(most_correlated)
-                components.pop(worst)
-                indices.remove(worst)
-                correlations = correlations[:, indices][indices, :]
-                indices = list(range(len(components)))
-            self._best_programs = [self._programs[-1][i] for i in
-                                   hall_of_fame[components]]
+        #     with np.errstate(divide='ignore', invalid='ignore'):
+        #         correlations = np.abs(np.corrcoef(evaluation))
+        #     np.fill_diagonal(correlations, 0.)
+        #     components = list(range(self.hall_of_fame))
+        #     indices = list(range(self.hall_of_fame))
+        #     # Iteratively remove least fit individual of most correlated pair
+        #     while len(components) > self.n_components:
+        #         most_correlated = np.unravel_index(np.argmax(correlations),
+        #                                            correlations.shape)
+        #         # The correlation matrix is sorted by fitness, so identifying
+        #         # the least fit of the pair is simply getting the higher index
+        #         worst = max(most_correlated)
+        #         components.pop(worst)
+        #         indices.remove(worst)
+        #         correlations = correlations[:, indices][indices, :]
+        #         indices = list(range(len(components)))
+        #     self._best_programs = [self._programs[-1][i] for i in
+        #                            hall_of_fame[components]]
 
+        # else:
+        # Find the best individual in the final generation
+        if self._metric.greater_is_better:
+            self._program = self._programs[-1][np.argmax(fitness)]
         else:
-            # Find the best individual in the final generation
-            if self._metric.greater_is_better:
-                self._program = self._programs[-1][np.argmax(fitness)]
-            else:
-                self._program = self._programs[-1][np.argmin(fitness)]
+            self._program = self._programs[-1][np.argmin(fitness)]
 
         return self
 
@@ -925,14 +969,13 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
         at once.
         
     transformer : None or _Function, optional, default = None
-        A transformer function applied to raw weight after calculation,
-        which may neutralize weight and apply restriction of tradable
-        instruments at each day. 
-        If provided, must be a _Function object created from
+        A transformer function applied to raw weight after calculation, which
+        may neutralize weight and apply restriction of tradable instruments at
+        each day.  If provided, must be a _Function object created from
         ``make_function`` factory with args (y_pred, trans_args), where
         ``y_pred`` is raw_weight, and ``trans_args`` is a dict passed by
-        calling ``fit`` or ``predict`` to store other useful info. See
-        example for how could it be utilized.
+        calling ``fit`` or ``predict`` to store other useful info. See example
+        for how could it be utilized.
 
     parsimony_coefficient : float or "auto", optional, default = 0.001
         This constant penalizes large programs by adjusting their fitness to
@@ -947,6 +990,13 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
         using c = Cov(l,f)/Var( l), where Cov(l,f) is the covariance between
         program size l and program fitness f in the population, and Var(l) is
         the variance of program sizes.
+        
+    p_grow_terminal : float, optional, default = 0.1
+        The probability that, when growing a tree, choose a real value
+        or feature for a node as terminal of the subtree, instead of
+        keeping it growing with functions. The max tree depth is still
+        capped by ``init_depth``, but it is unlikely to grow a deep tree
+        with high terminal prob.
 
     p_crossover : float, optional, default = 0.9
         The probability of performing crossover on a tournament winner.
@@ -971,13 +1021,12 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
         offspring in the next generation. This method helps to control bloat.
 
     p_point_mutation : float, optional, default = 0.01
-        The probability of performing point mutation on a tournament
-        winner. Point mutation takes the winner of a tournament and
-        selects random nodes from it to be replaced.  Terminals are
-        replaced by other terminals and functions are replaced by other
-        functions that require the same number of arguments as the
-        original node. The resulting tree forms an offspring in the next
-        generation.
+        The probability of performing point mutation on a tournament winner.
+        Point mutation takes the winner of a tournament and selects random
+        nodes from it to be replaced.  Terminals are replaced by other
+        terminals and functions are replaced by other functions that require
+        the same number of arguments as the original node. The resulting tree
+        forms an offspring in the next generation.
 
         Note : The above genetic operation probabilities must sum to less than
         one. The balance of probability is assigned to 'reproduction', where a
@@ -991,27 +1040,31 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
         this prob more than vanila gplearn version.
         
     elitism : int or float, optional, default = 1
-        Number or fraction of best performing samples among previous
-        population generation being carried to next interation intact.
-        Ensure best results will never be discarded by randomness.
+        Number or fraction of best performing samples in previous generation
+        that will be carried to next interation by reproduction.
+        Ensure best results will never be discarded by randomness, generally
+        also eliminate need for reproduction prob.
+        NOTE: Elitism preserve highest fitness after parsimony penalty, while
+        ``fit`` report best raw fitness before penalty, the reported "best" may
+        be discarded due to lower real fitness.
         
     variety : None or "fitness" or "corr", optional, default = None
         Measure of variety of population. If selected, will be report
         alongside other metrics in ``fit``. Two metrics are supported:
         
-        - "fitness" : Use 10 equally spaced bin between min / max
-          fitness of current population, and estimated non-parametric
-          distribution of sample fitness. Calculate entropy of prob
-          density: Variety = -sum(p_i * log(p_i)) / log(10)
-        - "corr" : Cache each genotype's PNL when evaluating fitness,
-          then calculate measure of correlation from stacked PNL matrix:
+        - "fitness" : Use 10 equally spaced bins between min / max fitness of
+          current population, and estimate non-parametric distribution of
+          sample fitness. Calculate entropy of prob density:
+          Variety = -sum(p_i * log(p_i)) / log(10)
+        - "corr" : Cache each genotype's PNL when evaluating fitness, then
+          calculate correlation from stacked PNL matrix: 
           Variety = 1.0 - norm(corr_matrix) / sqrt(corr_matrix.size)
 
     is_split : float, optional, default = 1.0
-        The fraction of samples from X to evaluate each program on. If
-        smaller than 1.0, split by ratio so first (n_samples * is_split)
-        entries are in-the-sample and others are out-of-sample. This is
-        suitable for time-series in ascending order.
+        The fraction of samples from X to evaluate each program on. If smaller
+        than 1.0, split by ratio so first (n_samples * is_split) entries are
+        in-the-sample and others are out-of-sample. This is suitable for
+        time-series in ascending order.
 
     feature_names : list, optional, default = None
         Optional list of feature names, used purely for representations in
@@ -1034,6 +1087,13 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
 
     verbose : int, optional, default = 0
         Controls the verbosity of the evolution building process.
+        
+    callbacks : None, callable or Iterable[callable], optional, default = None
+        Function or list of functions takes self as only argument and
+        return None. If provided, all functions are called in fitting at
+        the end of each generation.
+        Callbacks can be used to adjust population variety, implement
+        dynamic population size, or save current models.
 
     random_state : int, RandomState instance or None, optional, default = None
         If int, random_state is the seed used by the random number generator;
@@ -1077,6 +1137,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
                  metric='mean absolute error',
                  transformer=None,
                  parsimony_coefficient=0.001,
+                 p_grow_terminal=0.1,
                  p_crossover=0.9,
                  p_subtree_mutation=0.01,
                  p_hoist_mutation=0.01,
@@ -1085,12 +1146,12 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
                  elitism=1,
                  variety='corr',
                  is_split=1.0,
-                 sample_days=None,
                  feature_names=None,
                  warm_start=False,
                  low_memory=False,
                  n_jobs=1,
                  verbose=0,
+                 callbacks=None,
                  random_state=None):
         super(SymbolicRegressor, self).__init__(
             population_size=population_size,
@@ -1104,6 +1165,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
             metric=metric,
             transformer=transformer,
             parsimony_coefficient=parsimony_coefficient,
+            p_grow_terminal=p_grow_terminal,
             p_crossover=p_crossover,
             p_subtree_mutation=p_subtree_mutation,
             p_hoist_mutation=p_hoist_mutation,
@@ -1112,12 +1174,12 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
             elitism=elitism,
             variety=variety,
             is_split=is_split,
-            sample_days=sample_days,
             feature_names=feature_names,
             warm_start=warm_start,
             low_memory=low_memory,
             n_jobs=n_jobs,
             verbose=verbose,
+            callbacks=callbacks,
             random_state=random_state)
 
     def __str__(self):
@@ -1174,8 +1236,9 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
                              % (self.n_features_in_, n_features))
 
         y = self._program.execute(X)
-        if transform and getattr(self, '_transformer', None) is not None:
-            y = self._transformer(y, trans_args)
+        if hasattr(self, '_transformer'):
+            # _Function has null parameter.
+            y = self._transformer(None, y, trans_args)
         if ind is not None:
             y = pd.DataFrame(y, index=ind, columns=col)
         return y
