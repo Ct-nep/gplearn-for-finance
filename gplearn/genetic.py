@@ -19,6 +19,7 @@ from typing import *
 
 import numpy as np
 import pandas as pd
+import cloudpickle
 from joblib import Parallel, delayed
 from scipy.stats import rankdata
 from sklearn.base import BaseEstimator
@@ -41,7 +42,15 @@ MAX_INT = np.iinfo(np.int32).max
 
 def _parallel_evolve(n_programs, parents, X, y, sample_weight, 
                      trans_args, seeds, params):
-    """Private function used to build a batch of programs within a job."""
+    """Private function used to build a batch of programs within a job.
+    
+    It seems joblib has some problem to serialize ``parents`` properly, which
+    takes lengthy time for large list of ancestors. This could be mitigated by
+    mannually pickling it before call this function, then unpickle it on the
+    run. Use cloudpickle here since joblib already relies on it.
+    """
+    if isinstance(parents, bytes):
+        parents = cloudpickle.loads(parents)
     n_samples, n_features = X.shape[:2]
     # Unpack parameters
     tournament_size = params['tournament_size']
@@ -690,7 +699,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             if gen == 0:
                 parents = None
             else:
-                parents = self._programs[gen - 1]
+                parents = cloudpickle.dumps(self._programs[gen - 1])
 
             # Parallel loop
             n_jobs, n_programs, starts = _partition_estimators(
