@@ -1201,6 +1201,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
         self, 
         X: Union[List[pd.DataFrame], np.ndarray], 
         trans_args: Union[None, Dict[str, np.ndarray]] = None,
+        negative: bool = False,
         transform: bool = True,
     ) -> Union[pd.DataFrame, np.ndarray]:
         """Calculate portfolio weight using the best single program
@@ -1208,23 +1209,27 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
 
         Parameters
         ----------
-        X : List[pd.DataFrame] or array-like, shape = (n_samples,
-        n_features, n_firms)
-            Training vectors, where n_samples is the number of trading
-            days as samples, n_features is the number of features,
-            n_firms is number of firms / stocks.  If provided as
-            DataFrames, must have same index / columns, with shape
-            (n_samples, n_firms).
+        X : List[pd.DataFrame] or array-like, shape = (n_samples, n_features,
+        n_firms)
+            Training vectors, where n_samples is the number of trading days as
+            samples, n_features is the number of features, n_firms is number of
+            firms / stocks.  If provided as DataFrames, must have same index /
+            columns, with shape (n_samples, n_firms).
             
         trans_args : optional, None or dict, default = None
             Additional information like instrument universe, industry
-            classification etc. If provided, will be passed to weight
-            transform function. The method only check shape of these
-            data, since it does not know what more to be expected.
+            classification etc. If provided, will be passed to weight transform
+            function. The method only check shape of these data, since it does
+            not know what more to be expected.
+            
+        negative : bool, default = False
+            Take the negative raw weight. This happens before transform (if
+            any) to ensure the negative weight is achievable given restrictions
+            in transformer,
             
         transform : bool, default = True
-            If set to True, would transform raw weight with
-            self._transform before returning it.
+            If set to True, would transform raw weight with self._transform
+            before returning it.
 
         Returns
         -------
@@ -1245,6 +1250,8 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
                              % (self.n_features_in_, n_features))
 
         y = self._program.execute(X)
+        if negative:
+            y = -y
         if hasattr(self, '_transformer'):
             # _Function has null parameter.
             y = self._transformer(None, y, trans_args)

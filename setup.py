@@ -11,7 +11,7 @@ VERSION = gplearn.__version__
 setup(name='gplearn',
       version=VERSION,
       description=DESCRIPTION,
-      long_description=open("README.rst").read(),
+      long_description=open("README.md").read(),
       classifiers=['Development Status :: 3 - Alpha',
                    'Intended Audience :: Science/Research',
                    'Intended Audience :: Developers',

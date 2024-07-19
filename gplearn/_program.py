@@ -192,6 +192,9 @@ class _Program(object):
         param = function.valid_range[param]
         program = [(function, param)]
         terminal_stack = [function.arity]
+        # Indicator of whether current func support constant. For
+        # TSFunction supplying a constant makes no sense.
+        no_const = [isinstance(program[0][0], _TSFunction)]
 
         while terminal_stack:
             depth = len(terminal_stack)
@@ -208,14 +211,17 @@ class _Program(object):
                 param = function.valid_range[param]
                 program.append((function, param))
                 terminal_stack.append(function.arity)
+                no_const.append(isinstance(function, _TSFunction))
             else:
                 # We need a terminal, add a variable or constant
-                if self.const_range is not None:
+                if self.const_range is not None and not no_const[-1]:
                     terminal = random_state.randint(self.n_features + 1)
                 else:
                     terminal = random_state.randint(self.n_features)
                 if terminal == self.n_features:
                     terminal = random_state.uniform(*self.const_range)
+                    # We don't want any func has more than 1 const.
+                    no_const[-1] = True
                     if self.const_range is None:
                         # We should never get here
                         raise ValueError('A constant was produced with '
@@ -224,6 +230,7 @@ class _Program(object):
                 terminal_stack[-1] -= 1
                 while terminal_stack[-1] == 0:
                     terminal_stack.pop()
+                    no_const.pop()
                     if not terminal_stack:
                         return program
                     terminal_stack[-1] -= 1

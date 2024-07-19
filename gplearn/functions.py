@@ -84,7 +84,7 @@ class _TSFunction(_Function):
         return self.function(param, *args)
 
 
-def make_function(*, function, name, arity, wrap=True):
+def make_function(*, function, name, arity, wrap=True, skip_check=False):
     """Make a function node, a representation of a mathematical relationship.
 
     This factory function creates a function node, one of the core nodes in any
@@ -112,19 +112,28 @@ def make_function(*, function, name, arity, wrap=True):
         run slightly more slowly. If you are running single-threaded in an
         interactive Python session or have no need to save the model, set to
         `False` for faster runs.
+        
+    skip_check : bool, optional, default = False
+        Wether or not to validate inputs before wrapping the function.
 
+    Returns
+    -------
+    fn : _TSFunction
+        Wrapped and pickled function that can be registered and used during
+        evolution.
     """
-    if not isinstance(arity, int):
-        raise ValueError('arity must be an int, got %s' % type(arity))
-    if not isinstance(function, np.ufunc):
-        if function.__code__.co_argcount != arity:
-            raise ValueError('arity %d does not match required number of '
-                             'function arguments of %d.'
-                             % (arity, function.__code__.co_argcount))
-    if not isinstance(name, str):
-        raise ValueError('name must be a string, got %s' % type(name))
-    if not isinstance(wrap, bool):
-        raise ValueError('wrap must be an bool, got %s' % type(wrap))
+    if not skip_check:
+        if not isinstance(arity, int):
+            raise ValueError('arity must be an int, got %s' % type(arity))
+        if not isinstance(function, np.ufunc):
+            if function.__code__.co_argcount != arity:
+                raise ValueError('arity %d does not match required number of '
+                                'function arguments of %d.'
+                                % (arity, function.__code__.co_argcount))
+        if not isinstance(name, str):
+            raise ValueError('name must be a string, got %s' % type(name))
+        if not isinstance(wrap, bool):
+            raise ValueError('wrap must be an bool, got %s' % type(wrap))
     if wrap:
         return _Function(function=wrap_non_picklable_objects(function),
                          name=name,
@@ -133,14 +142,15 @@ def make_function(*, function, name, arity, wrap=True):
                      name=name,
                      arity=arity)
     
-def make_ts_function(*, function, name, arity, valid_range, wrap=True):
+def make_ts_function(*, function, name, arity, valid_range, 
+                     wrap=True, skip_check=False):
     """Make a time-series variant of function, _TSFunction instance.
 
     Parameters
     ----------
     function : callable
-        A function with signature `function(x1, *args)` that returns a Numpy
-        array of the same shape as its arguments.
+        A function with signature `function(params, x1, ...)` that returns a
+        Numpy array of the same shape as one of its input data array.
 
     name : str
         The name for the function as it should be represented in the program
@@ -155,29 +165,38 @@ def make_ts_function(*, function, name, arity, valid_range, wrap=True):
         function with lookback initialized / mutated / passed by parents
         from this list.
 
-    wrap : bool, optional (default=True)
+    wrap : bool, optional, default = True
         When running in parallel, pickling of custom functions is not supported
         by Python's default pickler. This option will wrap the function using
         cloudpickle allowing you to pickle your solution, but the evolution may
         run slightly more slowly. If you are running single-threaded in an
         interactive Python session or have no need to save the model, set to
         `False` for faster runs.
+        
+    skip_check : bool, optional, default = False
+        Wether or not to validate inputs before wrapping the function.
 
+    Returns
+    -------
+    fn : _TSFunction
+        Wrapped and pickled function that can be registered and used during
+        evolution.
     """
-    if not isinstance(arity, int):
-        raise ValueError('arity must be an int, got %s' % type(arity))
-    if not isinstance(function, np.ufunc):
-        if function.__code__.co_argcount-1 != arity:
-            raise ValueError('arity %d does not match required number of '
-                             'function arguments of %d.'
-                             % (arity, function.__code__.co_argcount-1))
-    if not isinstance(name, str):
-        raise ValueError('name must be a string, got %s' % type(name))
-    if not isinstance(wrap, bool):
-        raise ValueError('wrap must be an bool, got %s' % type(wrap))
-    if not isinstance(valid_range, Iterable) \
-        or not all([np.issubdtype(type(i), int) for i in valid_range]):
-        raise ValueError('date_range must be Iterable with integers.')
+    if not skip_check:
+        if not isinstance(arity, int):
+            raise ValueError('arity must be an int, got %s' % type(arity))
+        if not isinstance(function, np.ufunc):
+            if function.__code__.co_argcount-1 != arity:
+                raise ValueError('arity %d does not match required number of '
+                                'function arguments of %d.'
+                                % (arity, function.__code__.co_argcount-1))
+        if not isinstance(name, str):
+            raise ValueError('name must be a string, got %s' % type(name))
+        if not isinstance(wrap, bool):
+            raise ValueError('wrap must be an bool, got %s' % type(wrap))
+        if not isinstance(valid_range, Iterable) \
+            or not all([np.issubdtype(type(i), int) for i in valid_range]):
+            raise ValueError('date_range must be Iterable with integers.')
     if wrap:
         return _TSFunction(function=wrap_non_picklable_objects(function), 
                            name=name, arity=arity, valid_range=valid_range)
