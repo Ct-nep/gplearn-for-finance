@@ -64,5 +64,7 @@ doc/_build/
 # PyBuilder
 target/
 
-# Test notebook
+# Test data and programs
 test_gp.ipynb
+test_data/
+*.pkl

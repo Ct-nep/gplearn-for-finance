@@ -11,7 +11,7 @@ computer programs.
 
 import itertools
 from abc import ABCMeta, abstractmethod
-from collections import Iterable, Callable
+from collections.abc import Iterable, Callable
 from copy import copy
 from time import time
 from warnings import warn
@@ -354,7 +354,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         # Convert X DataFrames to ndarray
         if isinstance(X, Iterable) \
             and all([isinstance(i, pd.DataFrame) for i in X]):
-            warn(f'Received DataFrames as X, try converting.')
+            # warn(f'Received DataFrames as X, try converting.')
             if isinstance(y, pd.DataFrame):
                 size, idx, col = y.shape, y.index, y.columns
             else:
@@ -394,7 +394,8 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             # Ensure 2d but no dtype check.
             else:
                 try:
-                    trans_args[k] = check_array(v, dtype=None)
+                    trans_args[k] = check_array(v, dtype=None, 
+                                                force_all_finite='allow-nan')
                 except Exception as e:
                     raise ValueError(f'Cannot coerce additional data {k} '
                                     f'to compatible structure: {e}')
@@ -808,7 +809,11 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             elif self.variety == 'corr':
                 corr = np.stack([program._pnl for program in population], 
                                axis=1)
-                corr = np.corrcoef(corr)
+                # Remove NaNs.
+                corr = np.corrcoef(corr, rowvar=False)
+                mask = ~np.isnan(corr).all(axis=0)
+                mask = np.nonzero(mask)[0] 
+                corr = corr[mask][:, mask]
                 variety = 1. - np.linalg.norm(corr) / np.sqrt(corr.size)
             self.run_details_['variety'].append(variety)
 
@@ -910,8 +915,9 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
         The number of generations to evolve.
 
     tournament_size : integer, optional, default = 20
-        The number of programs that will compete to become part of the next
-        generation.
+        Size of randomly pitted (with replacement) programs to compete for
+        reproduction. Given population P and tournament size T, K-smallest
+        fitness has a winning chance of Prob(K) = ((P-K+1)/P) ** T - Prob(K-1)
 
     stopping_criteria : float, optional, default = 0.0
         The required metric value required in order to stop evolution early.
