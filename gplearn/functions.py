@@ -10,6 +10,7 @@ own custom functions.
 # License: BSD 3 clause
 
 import numpy as np
+import bottleneck as bn
 from joblib import wrap_non_picklable_objects
 from collections.abc import Iterable
 
@@ -143,7 +144,7 @@ def make_function(*, function, name, arity, wrap=True, skip_check=False):
                      arity=arity)
     
 def make_ts_function(*, function, name, arity, valid_range, 
-                     wrap=True, skip_check=False):
+                     wrap=True, skip_check=False) -> object:
     """Make a time-series variant of function, _TSFunction instance.
 
     Parameters
@@ -232,6 +233,52 @@ def _sigmoid(x1):
     with np.errstate(over='ignore', under='ignore'):
         return 1 / (1 + np.exp(-x1))
 
+########################
+# Customized functions #
+########################
+
+# Timing functions, which return scalar each day and broadcasted to 2d.
+def _csmax(x1):
+    '''Cross-sectional (daily) max. Bottleneck doesn't support quantile
+    which may works better.'''
+    res = bn.nanmax(x1, axis=1)
+    return np.where(np.isfinite(x1), res[:, None], np.nan)
+
+def _csmin(x1):
+    '''Cross-sectional (daily) min.'''
+    res = bn.nanmin(x1, axis=1)
+    return np.where(np.isfinite(x1), res[:, None], np.nan)
+
+def _csmean(x1):
+    '''Cross-sectional (daily) mean.'''
+    res = bn.nanmean(x1, axis=1)
+    return np.where(np.isfinite(x1), res[:, None], np.nan)
+
+def _csmedian(x1):
+    '''Cross-sectional (daily) median.'''
+    res = bn.nanmedian(x1, axis=1)
+    return np.where(np.isfinite(x1), res[:, None], np.nan)
+    
+def _csstd(x1):
+    '''Cross-sectional (daily) std'''
+    with np.errstate(over='ignore', under='ignore'):
+        res = bn.nanstd(x1, axis=1)
+    return np.where(np.isfinite(x1), res[:, None], np.nan)
+    
+# Cross-sectional transform functions, which return array each day using
+# only daily info.
+def _csdemean(x1):
+    '''Shortcut for x1 - csmean(x1), substitute of industry
+    neutralization which is too costly to implement as op.'''
+    with np.errstate(over='ignore', under='ignore'):
+        return x1 - bn.nanmean(x1, axis=1)[:, None]
+
+def _csrank(x1):
+    '''Rank daily data as pct'''
+    res = bn.nanrankdata(x1, axis=1)
+    with np.errstate(over='ignore', under='ignore'):
+        res = (res - 1.) / (bn.nanmax(res, axis=1)[:, None] - 1.)
+        return res
 
 add2 = _Function(function=np.add, name='add', arity=2)
 sub2 = _Function(function=np.subtract, name='sub', arity=2)
@@ -248,6 +295,9 @@ sin1 = _Function(function=np.sin, name='sin', arity=1)
 cos1 = _Function(function=np.cos, name='cos', arity=1)
 tan1 = _Function(function=np.tan, name='tan', arity=1)
 sig1 = _Function(function=_sigmoid, name='sig', arity=1)
+
+# Customized operators
+rank1 = make_function(function=_csrank, name='rank', arity=1, skip_check=True)
 
 _function_map = {'add': add2,
                  'sub': sub2,

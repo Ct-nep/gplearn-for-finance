@@ -10,18 +10,22 @@ computer programs.
 # License: BSD 3 clause
 
 import itertools
+import pathlib
+import pickle
 from abc import ABCMeta, abstractmethod
 from collections.abc import Iterable, Callable
 from copy import copy
+from operator import neg
 from time import time
-from warnings import warn
 from typing import *
+from warnings import warn
 
 import numpy as np
 import pandas as pd
 import cloudpickle
 from joblib import Parallel, delayed
-from scipy.stats import rankdata
+# from scipy.stats import rankdata
+from scipy.optimize import minimize, Bounds, LinearConstraint
 from sklearn.base import BaseEstimator
 from sklearn.base import RegressorMixin, TransformerMixin, ClassifierMixin
 from sklearn.exceptions import NotFittedError
@@ -32,8 +36,7 @@ from sklearn.utils.multiclass import check_classification_targets
 from ._program import _Program
 from .fitness import _fitness_map, _Fitness
 from .functions import _function_map, _Function, sig1 as sigmoid
-from .utils import _partition_estimators
-from .utils import check_random_state
+from .utils import _partition_estimators, check_random_state, _get_n_jobs
 
 __all__ = ['SymbolicRegressor', 'SymbolicClassifier', 'SymbolicTransformer']
 
@@ -49,8 +52,6 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight,
     mannually pickling it before call this function, then unpickle it on the
     run. Use cloudpickle here since joblib already relies on it.
     """
-    if isinstance(parents, bytes):
-        parents = cloudpickle.loads(parents)
     n_samples, n_features = X.shape[:2]
     # Unpack parameters
     tournament_size = params['tournament_size']
@@ -67,8 +68,10 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight,
     p_point_replace = params['p_point_replace']
     is_split = params['is_split']
     feature_names = params['feature_names']
-    return_pnl = params['return_pnl']
-
+    
+    # We are sending serialized program, decode it.
+    if isinstance(parents, bytes):
+        parents = cloudpickle.loads(parents)
     is_split = int(is_split * n_samples)
 
     def _tournament():
@@ -179,20 +182,16 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight,
         os_sample_weight[indices] = 0
 
         res = program.raw_fitness(X, y, curr_sample_weight, 
-                                  trans_args, return_pnl=return_pnl)
-        if return_pnl:
-            program.raw_fitness_ = res[0]
-            program._pnl = res[1]
-        else:
-            program.raw_fitness_ = res
+                                  trans_args, return_pnl=True)
+        program.raw_fitness_, program._pnl = res
         if is_split < n_samples:
             # Calculate OS fitness
             program.os_fitness_ = program.raw_fitness(X, y, os_sample_weight,
-                                                       trans_args)
+                                                      trans_args)
 
         programs.append(program)
 
-    return programs
+    return cloudpickle.dumps(programs)
 
 
 class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
@@ -313,9 +312,10 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                                      os_fitness,
                                      remaining_time))
     
-    def _validate_data(self, X, y, sample_weight, trans_args, fit=False):
-        '''Patch parent's _validate_data() method for 3-dim situation.
-        Due to drastic change of behavior, it is no long suitable to rely on
+    def validate_data(self, X, y, sample_weight, trans_args, fit=False):
+        '''Patch parent's _validate_data() method for 3-dim situation. Make it 
+        public so building blocks can rely on processed ndarray input only.
+        Due to drastic change of behavior, it is no long suitable to use 
         sklearn's validate method.
         
         Support inputs of multiple DataFrame as X and single DataFrame as y. If
@@ -333,6 +333,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
 
         sample_weight : None or pd.DataFrame or array-like, shape =
         (n_samples,) or (n_samples, n_firms)
+            See self.fit().
             
         trans_args : None or dict of DataFrame / array-like
             See self.fit().
@@ -515,7 +516,6 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             params['_transformer'] = self._transformer
         else:
             params['_transformer'] = None
-        params['return_pnl'] = self.variety == 'corr'
         return params
     
     def fit(
@@ -562,6 +562,9 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         if not 0 < self.p_grow_terminal < 1:
             raise ValueError(f'p_grow_terminal must in range (0., 1.), '
                              f'got {self.p_grow_terminal}')
+        if not 0 < self.is_split <= 1:
+            raise ValueError(f'is_split must in range (0., 1.], '
+                             f'got {self.is_split}')
         if self.callbacks is not None:
             if isinstance(self.callbacks, Callable):
                 self.callbacks = [self.callbacks]
@@ -575,7 +578,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
 
         random_state = check_random_state(self.random_state)
         X, y, sample_weight, trans_args, _, _ = \
-            self._validate_data(X, y, sample_weight, trans_args, fit=True)
+            self.validate_data(X, y, sample_weight, trans_args, fit=True)
         if isinstance(self, ClassifierMixin):
             n_samples, n_firms = y.shape
             if self.class_weight:
@@ -700,6 +703,10 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             if gen == 0:
                 parents = None
             else:
+                # Parallel has serialization issue ONLY on this list
+                # esp. with high n_jobs. If sent as-is, this incurs
+                # significant performance costs since second generation.
+                # Dump it and send bytes magically saves time.
                 parents = cloudpickle.dumps(self._programs[gen - 1])
 
             # Parallel loop
@@ -720,7 +727,9 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                 for i in range(n_jobs))
 
             # Reduce, maintaining order across different n_jobs
-            population = list(itertools.chain.from_iterable(population))
+            population = list(itertools.chain.from_iterable([
+                cloudpickle.loads(i) for i in population
+            ]))
 
             fitness = [program.raw_fitness_ for program in population]
             length = [program.length_ for program in population]
@@ -761,6 +770,10 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             
             self._programs.append(population)
 
+            # Always remove cached old PNL.
+            if gen > 0 and self._programs[gen-1]:
+                for program in self._programs[gen-1]:
+                        program._pnl = None
             # Remove old programs that didn't make it into the new population.
             if not self.low_memory:
                 for old_gen in np.arange(gen, 0, -1):
@@ -777,11 +790,6 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             elif gen > 0:
                 # Remove old generations
                 self._programs[gen - 1] = None
-            # Always remove cached PNL.
-            if self.variety == 'corr' and gen > 0 and self._programs[gen-1]:
-                for program in self._programs[gen-1]:
-                    if hasattr(program, '_pnl'):
-                        program._pnl = None
                 
             # Calculate population variety:
             #  - Method 'fitness' uses a non-parametric estimation of
@@ -892,6 +900,164 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             self._program = self._programs[-1][np.argmin(fitness)]
 
         return self
+    
+    def make_portfolio(
+        self, 
+        min_programs: int = 5, 
+        max_programs: Union[int, None] = None, 
+        fitness_threshold: Union[float, None] = None, 
+        corr_threshold: float = 0.9, 
+        use_raw_fitness: bool = True,
+        is_split: Union[float, None] = None, 
+        n_jobs: int = -1,
+    ) -> object:
+        '''From last generation, pick some best individuals by fitness and
+        correlation standard to form a portfolio. 
+        
+        The weight of programs are not fitted, which can be computed using
+        different methods by calling ``fit`` on returned object.
+        
+        Parameters
+        --------
+        min_programs : int, optional, default = 5
+            Minimum number of selected programs, raise RuntimeError if
+            cannot find enough programs.
+        
+        max_programs : int or None, optional, default = None
+            Maximum number of programs. Not setting means no limit.
+        
+        fitness_threshold : float or None, optional, default = None
+            Minimum (if greater is better, vice versa) individual fitness
+            required for adding it into the portfolio.
+        
+        corr_threshold : float, optional, default = 0.9
+            Maximum correlation threshold. Reject individual if it has higher
+            correlation with any previously picked program.
+            
+        use_raw_fitness : bool, optional, default = True
+            If True, use fitness before parsimony penalty when sorting
+            individuals and checking for threshold.
+            
+        is_split : None or float, optional, default = None
+            Same as main regressor's ``is_split``, proportion / numbers of
+            in-sample days to calculate mean / variance stats and perform
+            optimization. If not set, use main regressor's value.
+            
+        n_jobs : int, optional, default = -1
+            Number of subprocess used by portfolio instance in ``fit`` (only if
+            re-computation of PNL required) and ``predict``.  Passed to its
+            init args.
+            
+        Returns
+        --------
+        portfolio : SymbolicPortfolio
+            Unfitted portfolio.
+        '''
+        if not hasattr(self, '_metric'):
+            raise ValueError('Model must have a valid metric.')
+        if not hasattr(self, '_programs') or not len(self._programs) \
+            or not len(self._programs[-1]):
+                raise NotFittedError('SymbolicRegressor not fitted.')
+        if min_programs < 1:
+            raise ValueError('Invalid min_programs.')
+        if max_programs is not None and max_programs < min_programs:
+            raise ValueError('max_programs must be no less than min_programs.')
+        elif max_programs is None:
+            max_programs = np.inf
+        n_samples = self._programs[-1][0]._pnl.shape[0]
+        if is_split is None:
+            is_split = self.is_split
+        if isinstance(is_split, float) and 0. < is_split < 1.:
+            split = int(is_split * n_samples)
+        else:
+            raise ValueError('Invalid is_split parameter.')
+        
+        greater = self._metric.greater_is_better
+        if fitness_threshold is None:
+            fitness_threshold = -np.inf if greater else np.inf
+        key_fn = lambda x: x.raw_fitness_ if use_raw_fitness else x.fitness_
+        population = list(sorted(self._programs[-1], key=key_fn, reverse=greater))
+        fitness = list(map(key_fn, population))
+        pnl = np.stack([program._pnl for program in population], axis=1)
+        # Current fitness evalutaion returns all sample pnl regardless of
+        # is_split, so we can select different split here.
+        pnl = pnl[:split]
+        corr = np.corrcoef(pnl, rowvar=False)
+        port_idx = [0]
+        if greater:
+            fitness_threshold *= -1
+            fitness = list(map(neg, fitness))
+        # From best single program, iteratively add new program to portfolio
+        # if it:
+        #  1) Has better fitness than given threshold, and;
+        #  2) Pairwise correlation with all currently picked programs are
+        #     lower than given threshold.
+        for i in range(len(population)):
+            if fitness[i] > fitness_threshold or len(port_idx) >= max_programs:
+                break
+            # Compare signed instead of absolute value since portfolio
+            # weights are restricted to be positive later.
+            if corr[i, port_idx].max() < corr_threshold:
+                port_idx.append(i)
+        if len(port_idx) < min_programs:
+            raise RuntimeError(f'Cannot find enough programs: Found'
+                            f'{len(port_idx)} / {min_programs}')
+        portfolio = SymbolicPortfolio(
+            programs=[population[i] for i in port_idx],
+            is_split=is_split,
+            n_jobs=n_jobs,
+        )
+        return portfolio
+    
+    def save(self, path='./saved_model.pkl'):
+        '''Serialize the whole model and dump it to given path.
+        
+        Under the hood this just calls pickle to do the work. It is not
+        suitable for long-term storage, and only guaranteed to work when
+        de-serialized in the same python environment.
+        
+        Parameters
+        --------
+        path : str or pathlike, optional, default = './saved_model.pkl'
+            Path to save the model. Expected to end with filename in extension
+            type of .pkl, will be created if not exist.
+        '''
+        path = pathlib.Path(path)
+        if not str(path).endswith('.pkl'):
+            raise ValueError('path must be filename with .pkl extension.')
+        path.parent.mkdir(exist_ok=True, parents=True)
+        with open(path, 'wb') as f:
+            pickle.dump(self, f)
+            
+    def load(self, path, program_only=False):
+        '''Load the model file dumped by ``save``.
+        
+        Parameters
+        --------
+        path : str or pathlike
+            Path to the saved model.
+            
+        program_only : bool, optional, default = False
+            If True, only load back serialized programs in the file. May cause
+            unexpected behavior if other parameters are different.
+            
+        Returns
+        --------
+        self : object
+            Loaded model.
+        '''
+        with open(path, 'rb') as f:
+            model = pickle.load(f)
+        if not isinstance(model, self.__class__):
+            raise ValueError('Invalid model file.')
+        if program_only:
+            if hasattr(model, '_programs'):
+                self._programs = model._programs
+            if hasattr(model, '_program'):
+                self._program = model._program
+        else:
+            self.__dict__.update(model.__dict__)
+        return self  
 
 
 class SymbolicRegressor(BaseSymbolic, RegressorMixin):
@@ -1244,10 +1410,19 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
             DataFrame of same shape, index and columns.
         """
         if not hasattr(self, '_program'):
-            raise NotFittedError('SymbolicRegressor not fitted.')
+            # Snapshot during fit() may not have this attribute, set it
+            # as current best.
+            if hasattr(self, '_metric') and hasattr(self, '_programs') \
+                and len(self._programs) and len(self._programs[-1]):
+                fitness = [program.fitness_ for program in self._programs[-1]]
+                idx = np.argmax(fitness) \
+                    if self._metric.greater_is_better else np.argmin(fitness)
+                self._program = self._programs[-1][idx]
+            else:
+                raise NotFittedError('SymbolicRegressor not fitted.')
 
         X, _, _, trans_args, ind, col = \
-            self._validate_data(X, None, None, trans_args, fit=False)
+            self.validate_data(X, None, None, trans_args, fit=False)
         n_features = X.shape[1]
         if self.n_features_in_ != n_features:
             raise ValueError('Number of features of the model must match the '
@@ -1256,11 +1431,406 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
                              % (self.n_features_in_, n_features))
 
         y = self._program.execute(X)
-        if negative:
-            y = -y
-        if hasattr(self, '_transformer'):
-            # _Function has null parameter.
-            y = self._transformer(None, y, trans_args)
+        if negative: y = -y
+        if transform:
+            if hasattr(self, '_transformer'):
+                # _Function has null parameter.
+                y = self._transformer(None, y, trans_args)
+            else:
+                raise ValueError('Regressor has no transformer.')
         if ind is not None:
             y = pd.DataFrame(y, index=ind, columns=col)
         return y
+
+
+class SymbolicPortfolio(BaseEstimator):
+    '''Helper class to formulate portfolio from programs. 
+    
+    Parameters
+    --------
+    programs : None or List[_Program]
+        Candidate programs to form the portfolio.
+        
+    method : 'equal' | 'sharpe', optional, default = 'sharpe'
+        Optimization method.
+        - 'equal' forms a simple equal-weight portfolio.
+        - 'sharpe' performs mean-varaince optimization to maximize 
+            in-sample mean return scaled by standard deviation. Due to possible
+            limitation on buy & sale, only positive weights are allowed.
+        
+    is_split : float, optional, default = 1.0
+        The fraction of samples from X in optimization. If smaller than 1.0,
+        split by ratio so first (n_samples * is_split) entries are
+        in-the-sample and others are out-of-sample. This is suitable for
+        time-series in ascending order.
+        
+    n_jobs : integer, optional, default = 1
+        The number of jobs to run in parallel for `fit`. If -1, then the number
+        of jobs is set to the number of cores.
+        
+    verbose : int, optional, default = 0
+        Verbosity of parallel evaluation. If > 0, output log from
+        ``joblib.Parallel`` in ``fit`` and ``predict``.
+        
+    Attributes
+    -------- 
+    weights : array-like
+        Weights for each program. Has same shape with ``programs``.
+    '''
+    def __init__(
+        self, 
+        programs: Union[None, List[_Program]] = None, 
+        method: str = 'sharpe',
+        is_split: float = 1.0,
+        n_jobs: int = -1,
+        verbose: int = 0,
+    ) -> None:
+        self.programs = programs
+        self.method = method
+        self.is_split = is_split
+        self.n_jobs = n_jobs
+        self.verbose = verbose
+        self.weights = None
+        
+    def __repr__(self):
+        return f'{self.__class__.__name__}(method={self.method}, '\
+            f'fitted={self.weights is not None}, '\
+            f'n_programs={len(self.programs)})'
+    
+    def validate_data(self, X, y, sample_weight, trans_args, fit=False):
+        '''Patch parent's _validate_data() method for 3-dim situation. Make it 
+        public so building blocks can rely on processed ndarray input only.
+        Due to drastic change of behavior, it is no long suitable to use 
+        sklearn's validate method.
+        
+        Support inputs of multiple DataFrame as X and single DataFrame as y. If
+        this is the case, convert them to ndarray and preserve index / columns
+        info.
+        
+        Basically a replication of ``BaseSymbolic``'s method.
+        
+        Parameters
+        ----------
+        X : List[pd.DataFrame] or array-like, shape = (n_samples, n_features,
+        n_firms)
+            See self.fit().
+
+        y : None or pd.DataFrame or array-like, shape = (n_samples, n_firms)
+            See self.fit().
+
+        sample_weight : Any
+            Weight is not supported by either method and not used here,
+            thus not validated.
+            
+        trans_args : None or dict of DataFrame / array-like
+            See self.fit().
+            
+        fit : bool, default=False
+            If set to True, overwrite regressor with inputs' feature number and
+            names, otherwise only check if they match with previous call of
+            fit.
+
+        Returns
+        -------
+        out : tuple
+            All input data converted to correct dtype and shape, plus index and
+            columns info.
+        '''
+        idx, col = None, None
+        # Convert X DataFrames to ndarray
+        if isinstance(X, Iterable) \
+            and all([isinstance(i, pd.DataFrame) for i in X]):
+            # warn(f'Received DataFrames as X, try converting.')
+            if isinstance(y, pd.DataFrame):
+                size, idx, col = y.shape, y.index, y.columns
+            else:
+                size, idx, col = X[0].shape, X[0].index, X[0].columns
+            if not all([i.shape==size and (i.index==idx).all() \
+                        and (i.columns==col).all() for i in X]):
+                raise ValueError('All DataFrames must have same '
+                                 'shape, indices and columns')
+            X = np.stack(
+                [check_array(i, dtype=float, force_all_finite='allow-nan') \
+                    for i in X], 
+                axis=1,
+            )
+        # Call check_array on y and other arguments.
+        if y is not None:
+            # Ensure float unless for classification task.
+            y = check_array(y, force_all_finite='allow-nan', dtype=float)
+        if trans_args is None:
+            trans_args = dict()
+        for k, v in trans_args.items():
+            if v is None:
+                del trans_args[k]
+            # Ensure 2d but no dtype check.
+            else:
+                try:
+                    trans_args[k] = check_array(v, dtype=None, 
+                                                force_all_finite='allow-nan')
+                except Exception as e:
+                    raise ValueError(f'Cannot coerce additional data {k} '
+                                    f'to compatible structure: {e}')
+        X = super()._validate_data(X, force_all_finite='allow-nan', 
+                                   reset=fit, ensure_2d=False, 
+                                   allow_nd=True, dtype=float)
+        super()._check_n_features(X, reset=fit)
+        # Check data shape, cannot rely on sklearn for 3d data.
+        if len(X.shape) != 3:
+            raise ValueError(f'Invalid X shape {X.shape}')
+        X_shape = (X.shape[0], X.shape[2])
+        if y is not None and X_shape != y.shape:
+            raise ValueError(f'X, y must have same shape except on '
+                                f'n_feature dim, received {X.shape}, '
+                                f'{y.shape}')
+        for k, v in trans_args.items():
+            if X_shape != v.shape:
+                raise ValueError(f'Any additional data must have shape '
+                                 f'(n_samples, n_firms), received '
+                                 f'{v.shape} for key {k}')
+        # If there is notable all-NaN period at start of X or y, warn.
+        mask = np.isnan(X).all(axis=2).any(axis=1)
+        mask |= np.isnan(y).all(axis=1)
+        idx = 0
+        while mask[idx] and (idx < len(mask)):
+            idx += 1
+        if idx > 0.1 * len(mask):
+            warn(f'There is initial NaN period in X, y for up to {idx+1} '
+                 f'days. It is recommended to drop initial NaNs to obtain '
+                 f'better performance and accurate metrics.')
+        return (X, y, sample_weight, trans_args, idx, col)
+        
+    def fit(
+        self,
+        X: Union[None, List[pd.DataFrame], np.ndarray] = None, 
+        y: Union[None, np.ndarray] = None, 
+        sample_weight: Any = None, 
+        trans_args: Union[None, Dict[str, np.ndarray]] = None,
+        method: Union[None, str] = None,
+    ) -> object:
+        '''Fit portfolio weight. Using given method.
+        
+        If only ``method`` is specified, either a equal-weight portfolio is
+        formed, or all programs must have pre-calculated ``_pnl`` attribute to
+        perform optimization. Otherwise input data is used to perform
+        optimization.
+        
+        Parameters
+        ----------
+        X : None or List[pd.DataFrame] or array-like, shape = (n_samples,
+        n_features, n_firms), optional, default = None
+            Training vectors, where n_samples is the number of trading days as
+            samples, n_features is the number of features, n_firms is number of
+            firms / stocks.  If provided as DataFrames, must have same index /
+            columns, with shape (n_samples, n_firms).
+
+        y : None, pd.DataFrame or array-like, shape = (n_samples, n_firms)
+            Target values, if provided as DataFrame, must have same index /
+            columns with all X DataFrame, with shape (n_samples, n_firms).
+
+        sample_weight : Any
+            Weight is not supported by either method and not used here, retains
+            signature for sklearn compatibility.
+            
+        trans_args : None or dict, optional, default = None
+            Additional information like instrument universe, industry
+            classification etc. If provided, will be passed to fitness
+            evaluation function. The method only check shape of these data,
+            since it does not know what more to be expected.
+
+        method : None or 'equal' or 'sharpe', optional, default = None
+            Specifying method will override ``init`` args.
+            - 'equal' forms a simple equal-weight portfolio.
+            - 'sharpe' performs mean-varaince optimization to maximize 
+              in-sample mean return scaled by standard deviation. Due to
+              possible limitation on buy & sale, only positive weights are
+              allowed.
+              
+        Returns
+        -------
+        self : object
+            Returns self.
+        '''
+        def _parallel_wrapper(program, X, y, trans_args):
+            program = cloudpickle.loads(program)
+            pred = program.execute_transform(X, trans_args)
+            program._pnl = np.nansum(pred * y, axis=1)
+            return cloudpickle.dumps(program)
+        
+        def sharpe_target(w, ret, cov):
+            return -w @ ret / np.sqrt(w @ cov @ w)
+        
+        if not isinstance(self.programs, Iterable) \
+            or not all([isinstance(i, _Program) for i in self.programs]):
+            raise ValueError('Invalid candidate program list.')
+        method = method if method is not None else self.method
+        if len(self.programs) == 1 or method == 'equal':
+            self.weights = np.ones(len(self.programs), dtype=float) \
+                / len(self.programs)
+            return self
+        if method != 'sharpe':
+            raise ValueError('Only support method "equal" or "sharpe".')
+        if not 0 < self.is_split <= 1:
+            raise ValueError(f'is_split must in range (0., 1.], '
+                             f'got {self.is_split}')
+        has_pnl = all([hasattr(i, '_pnl') for i in self.programs])
+        if not has_pnl and X is None:
+            raise ValueError('Programs have no pre-computed PNL, '
+                             'and X is not provided.')
+            
+        n_jobs = min(_get_n_jobs(self.n_jobs), len(self.programs))
+        # Get programs with PNL data.
+        if X is not None:
+            X, y, _, trans_args, _, _ = \
+                self.validate_data(X, y, None, trans_args, fit=True)
+            programs = [cloudpickle.dumps(i) for i in self.programs]
+            programs = Parallel(n_jobs=n_jobs, 
+                                verbose=int(self.verbose>0) * 11)(
+                delayed(_parallel_wrapper)(i, X, y, trans_args) 
+                    for i in programs
+            )
+            programs = [cloudpickle.loads(i) for i in programs]
+        else:
+            programs = self.programs
+        
+        # Split IS / OS PNL and calculate IS stats accordingly.
+        pnl = np.stack([i._pnl for i in programs], axis=1)
+        is_split = int(self.is_split * pnl.shape[0])
+        pnl_is = pnl[:is_split]
+        ret = np.nanmean(pnl_is, axis=0)
+        # Pandas implementation handles NaN efficiently.
+        cov = pd.DataFrame(pnl_is).cov().to_numpy()
+        # Set up boundary and constant limit, init starting guess.
+        bounds = Bounds(0., 1.)
+        constraints = LinearConstraint(np.ones_like(ret), 1., 1.)
+        w0 = np.ones_like(ret) / len(ret)
+        res = minimize(sharpe_target, w0, args=(ret, cov), 
+                       constraints=constraints, bounds=bounds, 
+                       method='trust-constr')
+        self.weights = res.x
+        return self
+    
+    def predict(
+        self,
+        X: Union[None, List[pd.DataFrame], np.ndarray], 
+        trans_args: Union[None, Dict[str, np.ndarray]] = None,
+    ) -> Union[np.ndarray, pd.DataFrame]:
+        """Combine predictions from each program based on program weights.
+
+        Parameters
+        ----------
+        X : List[pd.DataFrame] or array-like, shape = (n_samples, n_features,
+        n_firms)
+            Training vectors, where n_samples is the number of trading days as
+            samples, n_features is the number of features, n_firms is number of
+            firms / stocks.  If provided as DataFrames, must have same index /
+            columns, with shape (n_samples, n_firms).
+            
+        trans_args : optional, None or dict, default = None
+            Additional information like instrument universe, industry
+            classification etc. If provided, will be passed to weight transform
+            function. The method only check shape of these data, since it does
+            not know what more to be expected.
+
+        Returns
+        -------
+        weight : pd.DataFrame or array-like, shape = (n_samples, n_firms)
+            Returns weight. If X is list of DataFrames, return weight as
+            DataFrame of same shape, index and columns.
+        """
+        def _parallel_wrapper(program, X, trans_args):
+            program = cloudpickle.loads(program)
+            weight = program.execute_transform(X, trans_args, force=True)
+            return weight
+        
+        if not isinstance(self.programs, Iterable) \
+            or not all([isinstance(i, _Program) for i in self.programs]):
+            raise ValueError('Invalid candidate program list.')
+        if self.weights is None:
+            raise NotFittedError(f'{self.__class__.__name__} not fitted.')
+        
+        n_jobs = min(_get_n_jobs(self.n_jobs), len(self.programs))
+        X, _, _, trans_args, idx, col = \
+            self.validate_data(X, None, None, trans_args, fit=True)
+        programs = [cloudpickle.dumps(i) for i in self.programs]
+        programs = Parallel(n_jobs=n_jobs, 
+                            verbose=int(self.verbose>0) * 11)(
+            delayed(_parallel_wrapper)(i, X, trans_args) 
+                for i in programs
+        )
+        stock_weights = sum([pos * wt 
+                             for pos, wt in zip(programs, self.weights)])
+        if idx is not None:
+            stock_weights = pd.DataFrame(stock_weights, index=idx, columns=col)
+        return stock_weights
+    
+    def _predcit_single(self, X, trans_args):
+        if not isinstance(self.programs, Iterable) \
+            or not all([isinstance(i, _Program) for i in self.programs]):
+            raise ValueError('Invalid candidate program list.')
+        if self.weights is None:
+            raise NotFittedError(f'{self.__class__.__name__} not fitted.')
+        
+        X, _, _, trans_args, idx, col = \
+            self.validate_data(X, None, None, trans_args, fit=True)
+        stock_weights = np.zeros_like(X[:, 0], dtype=float)
+        for program, wt in zip(self.programs, self.weights):
+            pos = program.execute_transform(X, trans_args, force=True)
+            stock_weights += pos * wt
+        if idx is not None:
+            stock_weights = pd.DataFrame(stock_weights, index=idx, columns=col)
+        return stock_weights
+
+    def fit_predict(
+        self,
+        method: str ='sharpe',
+        X: Union[None, List[pd.DataFrame], np.ndarray] = None, 
+        y: Union[None, np.ndarray] = None, 
+        sample_weight: Any = None, 
+        trans_args: Union[None, Dict[str, np.ndarray]] = None
+    ) -> Union[np.ndarray, pd.DataFrame]:
+        '''Shortcut to fit and predict on same input. Not optimized. See
+        ``fit`` for parameter definition.
+        '''
+        _ = self.fit(X, y, None, trans_args, method)
+        return self.predict(X, trans_args)
+    
+    def save(self, path='./saved_portfolio.pkl'):
+        '''Serialize the whole model and dump it to given path.
+        
+        Under the hood this just calls pickle to do the work. It is not
+        suitable for long-term storage, and only guaranteed to work when
+        de-serialized in the same python environment.
+        
+        Parameters
+        --------
+        path : str or pathlike, optional, default = './saved_model.pkl'
+            Path to save the model. Expected to end with filename in extension
+            type of .pkl, will be created if not exist.
+        '''
+        path = pathlib.Path(path)
+        if not str(path).endswith('.pkl'):
+            raise ValueError('path must be filename with .pkl extension.')
+        path.parent.mkdir(exist_ok=True, parents=True)
+        with open(path, 'wb') as f:
+            pickle.dump(self, f)
+            
+    def load(self, path):
+        '''Load the model file dumped by ``save``.
+        
+        Parameters
+        --------
+        path : str or pathlike
+            Path to the saved model.
+
+        Returns
+        --------
+        self : object
+            Loaded model.
+        '''
+        with open(path, 'rb') as f:
+            model = pickle.load(f)
+        if not isinstance(model, self.__class__):
+            raise ValueError('Invalid model file.')
+        self.__dict__.update(model.__dict__)
+        return self  

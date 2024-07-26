@@ -411,7 +411,7 @@ class _Program(object):
 
         # We should never get here
         return None
-
+    
     def get_all_indices(self, n_samples=None, is_split=None):
         """Get the indices on which to evaluate the fitness of a program.
 
@@ -449,6 +449,46 @@ class _Program(object):
     def _indices(self):
         """Get the indices used to measure the program's fitness."""
         return self.get_all_indices()[0]
+    
+    def execute_transform(
+        self, 
+        X: np.ndarray, 
+        trans_args: Dict[str, np.ndarray],
+        force: bool = False
+    ) -> np.ndarray:
+        """Execute the program and call the transformer to return processed 
+        weight. No validation on input.
+
+        Parameters
+        ----------
+        X : array-like, shape = (n_samples, n_features, n_firms)
+            Training vectors, where n_samples is the number of sample days and
+            n_features is the number of features.
+            
+        trans_args : dict of array-like
+            Additional information received from ``fit`` call, can be universe
+            and industry classification etc. to help repair and validate
+            weights. Require a customized transform function to tell how it
+            works when creating GP instance.
+        
+        force : bool, optional, default = False
+            If True, return raw weight if no valid transformer, otherwise raise
+            error.
+
+        Returns
+        -------
+        weight : array-like, shape = (n_samples, n_firms)
+            The transformed weight matrix.
+        """
+        y_pred = self.execute(X)
+        if self.transformer is None:
+            if force:
+                return y_pred
+            else:
+                raise RuntimeError('Program has no transformer.')
+        # Transformer has a null parameter.
+        y_pred = self.transformer(None, y_pred, trans_args)
+        return y_pred
 
     def raw_fitness(
         self, 
@@ -488,11 +528,7 @@ class _Program(object):
         raw_fitness : float
             The raw fitness of the program.
         """
-        y_pred = self.execute(X)
-        if self.transformer is not None:
-            # transformer is _Function instance which is expected to
-            # have a null param.
-            y_pred = self.transformer(None, y_pred, trans_args)
+        y_pred = self.execute_transform(X, trans_args, force=True)
         raw_fitness = self.metric(y, y_pred, sample_weight)
         if return_pnl:
             return raw_fitness, np.nansum(y_pred*y, axis=1)
