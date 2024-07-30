@@ -13,10 +13,11 @@ from copy import copy
 from typing import *
 
 import numpy as np
+import pandas as pd
 from sklearn.utils.random import sample_without_replacement
 
 from .functions import _Function, _TSFunction
-from .utils import check_random_state
+from .utils import check_random_state, _check_input
 
 
 class _Program(object):
@@ -360,21 +361,9 @@ class _Program(object):
         """Calculates the number of functions and terminals in the program."""
         return len(self.program)
 
-    def execute(self, X):
-        """Execute the program according to X.
-
-        Parameters
-        ----------
-        X : array-like, shape = (n_samples, n_features, n_firms)
-            Training vectors, where n_samples is the number of samples
-            and n_features is the number of features.
-
-        Returns
-        -------
-        y_hats : array-like, shape = (n_samples, n_firms)
-            The result of executing the program on X.
-
-        """
+    def _execute(self, X):
+        '''Private function to read program as stack and perform
+        computation. Only support ndarray and no validation on input.'''
         # Check for single-node programs
         node, param = self.program[0]
         if isinstance(node, float):
@@ -412,6 +401,67 @@ class _Program(object):
         # We should never get here
         return None
     
+    def _execute_transform(self, X, trans_args, force=False):
+        """Execute the program and call the transformer to return processed 
+        weight. Set force=True ignore error if program have no transformer.
+        
+        Only support ndarray / dict and no validation on input.
+        """
+        y_pred = self._execute(X)
+        if self.transformer is None:
+            if force:
+                return y_pred
+            else:
+                raise RuntimeError('Program has no transformer.')
+        # Transformer has a null parameter.
+        y_pred = self.transformer(None, y_pred, trans_args)
+        return y_pred
+    
+    def execute(
+        self, 
+        X, 
+        trans_args=None, 
+        transform=True
+    ) -> Union[pd.DataFrame, np.ndarray]:
+        """Execute the program according to X. Also transform raw result with 
+        transformer if required. Support DataFrame inputs.
+
+        Parameters
+        ----------
+        X : List[pd.DataFrame] or array-like, shape = (n_samples, n_features,
+        n_firms)
+            Input vectors, where n_samples is the number of trading days as
+            samples, n_features is the number of features, n_firms is number of
+            firms / stocks.  If provided as DataFrames, must have same index /
+            columns, with shape (n_samples, n_firms).
+            
+        trans_args : None or dict, optional, default = None
+            Additional information like instrument universe, industry
+            classification etc. If provided, will be passed to weight transform
+            function. The method only check shape of these data, since it does
+            not know what more to be expected.
+            
+        transform : bool, optional, default = True
+            If True, use self.transformer object to transform raw weight
+            after execution of program. Raise error if no transformer.
+
+        Returns
+        -------
+        y_hats : pd.DataFrame or array-like, shape = (n_samples, n_firms)
+            The result of executing the program on X. If input is DataFrames,
+            returns in DataFrame with same index and columns info.
+        """
+        X, _, _, trans_args, idx, col = _check_input(X, None, None, trans_args)
+        y_pred = self._execute(X)
+        if transform:
+            if self.transformer is None:
+                raise RuntimeError('Program has no transformer.')
+            # Transformer has a null parameter.
+            y_pred = self.transformer(None, y_pred, trans_args)
+        if col is not None:
+            y_pred = pd.DataFrame(y_pred, index=idx, columns=col)
+        return y_pred
+        
     def get_all_indices(self, n_samples=None, is_split=None):
         """Get the indices on which to evaluate the fitness of a program.
 
@@ -449,46 +499,6 @@ class _Program(object):
     def _indices(self):
         """Get the indices used to measure the program's fitness."""
         return self.get_all_indices()[0]
-    
-    def execute_transform(
-        self, 
-        X: np.ndarray, 
-        trans_args: Dict[str, np.ndarray],
-        force: bool = False
-    ) -> np.ndarray:
-        """Execute the program and call the transformer to return processed 
-        weight. No validation on input.
-
-        Parameters
-        ----------
-        X : array-like, shape = (n_samples, n_features, n_firms)
-            Training vectors, where n_samples is the number of sample days and
-            n_features is the number of features.
-            
-        trans_args : dict of array-like
-            Additional information received from ``fit`` call, can be universe
-            and industry classification etc. to help repair and validate
-            weights. Require a customized transform function to tell how it
-            works when creating GP instance.
-        
-        force : bool, optional, default = False
-            If True, return raw weight if no valid transformer, otherwise raise
-            error.
-
-        Returns
-        -------
-        weight : array-like, shape = (n_samples, n_firms)
-            The transformed weight matrix.
-        """
-        y_pred = self.execute(X)
-        if self.transformer is None:
-            if force:
-                return y_pred
-            else:
-                raise RuntimeError('Program has no transformer.')
-        # Transformer has a null parameter.
-        y_pred = self.transformer(None, y_pred, trans_args)
-        return y_pred
 
     def raw_fitness(
         self, 
@@ -528,7 +538,7 @@ class _Program(object):
         raw_fitness : float
             The raw fitness of the program.
         """
-        y_pred = self.execute_transform(X, trans_args, force=True)
+        y_pred = self._execute_transform(X, trans_args, force=True)
         raw_fitness = self.metric(y, y_pred, sample_weight)
         if return_pnl:
             return raw_fitness, np.nansum(y_pred*y, axis=1)
@@ -551,6 +561,9 @@ class _Program(object):
         """
         if parsimony_coefficient is None:
             parsimony_coefficient = self.parsimony_coefficient
+        # Penalize over-simplification.
+        if len(self.program) == 1:
+            return -1.
         penalty = parsimony_coefficient * len(self.program) * self.metric.sign
         return self.raw_fitness_ - penalty
 

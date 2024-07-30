@@ -36,7 +36,8 @@ from sklearn.utils.multiclass import check_classification_targets
 from ._program import _Program
 from .fitness import _fitness_map, _Fitness
 from .functions import _function_map, _Function, sig1 as sigmoid
-from .utils import _partition_estimators, check_random_state, _get_n_jobs
+from .utils import _partition_estimators, check_random_state, _get_n_jobs, \
+    _check_input
 
 __all__ = ['SymbolicRegressor', 'SymbolicClassifier', 'SymbolicTransformer']
 
@@ -312,122 +313,12 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                                      os_fitness,
                                      remaining_time))
     
-    def validate_data(self, X, y, sample_weight, trans_args, fit=False):
-        '''Patch parent's _validate_data() method for 3-dim situation. Make it 
-        public so building blocks can rely on processed ndarray input only.
-        Due to drastic change of behavior, it is no long suitable to use 
-        sklearn's validate method.
-        
-        Support inputs of multiple DataFrame as X and single DataFrame as y. If
-        this is the case, convert them to ndarray and preserve index / columns
-        info.
-        
-        Parameters
-        ----------
-        X : List[pd.DataFrame] or array-like, shape = (n_samples, n_features,
-        n_firms)
-            See self.fit().
-
-        y : None or pd.DataFrame or array-like, shape = (n_samples, n_firms)
-            See self.fit().
-
-        sample_weight : None or pd.DataFrame or array-like, shape =
-        (n_samples,) or (n_samples, n_firms)
-            See self.fit().
-            
-        trans_args : None or dict of DataFrame / array-like
-            See self.fit().
-            
-        fit : bool, default=False
-            If set to True, overwrite regressor with inputs' feature number and
-            names, otherwise only check if they match with previous call of
-            fit.
-
-        Returns
-        -------
-        out : tuple
-            All input data converted to correct dtype and shape, plus index and
-            columns info.
+    def _validate_data(self, X, y, sample_weight, trans_args, fit=False):
+        '''Patch parent's _validate_data() method for 3-dim situation.
         '''
-        idx, col = None, None
-        if y is None and sample_weight is not None:
-            raise ValueError('Input y is missing.')
-        # Convert X DataFrames to ndarray
-        if isinstance(X, Iterable) \
-            and all([isinstance(i, pd.DataFrame) for i in X]):
-            # warn(f'Received DataFrames as X, try converting.')
-            if isinstance(y, pd.DataFrame):
-                size, idx, col = y.shape, y.index, y.columns
-            else:
-                size, idx, col = X[0].shape, X[0].index, X[0].columns
-            if not all([i.shape==size and (i.index==idx).all() \
-                        and (i.columns==col).all() for i in X]):
-                raise ValueError('All DataFrames must have same '
-                                 'shape, indices and columns')
-            X = np.stack(
-                [check_array(i, dtype=float, force_all_finite='allow-nan') \
-                    for i in X], 
-                axis=1,
-            )
-        # Call check_array on y and other arguments.
-        if y is not None:
-            # Ensure float unless for classification task.
-            y_dtype = None if isinstance(self, ClassifierMixin) else float
-            y = check_array(y, force_all_finite='allow-nan', dtype=y_dtype)
-        if sample_weight is None:
-            sample_weight = np.ones_like(y, dtype=float)
-        else:
-            # sample_weight could be 1d, boradcast it to 2d
-            sample_weight = check_array(sample_weight, dtype=float, 
-                                        force_all_finite='allow-nan',
-                                        ensure_2d=False)
-            if len(sample_weight.shape) > 2:
-                raise ValueError(f'Invalid sample_weight shape '
-                                 f'{sample_weight.shape}')
-            if len(sample_weight) == 1:
-                sample_weight = np.broadcast_to(sample_weight[..., None], 
-                                                y.shape)
-        if trans_args is None:
-            trans_args = dict()
-        for k, v in trans_args.items():
-            if v is None:
-                del trans_args[k]
-            # Ensure 2d but no dtype check.
-            else:
-                try:
-                    trans_args[k] = check_array(v, dtype=None, 
-                                                force_all_finite='allow-nan')
-                except Exception as e:
-                    raise ValueError(f'Cannot coerce additional data {k} '
-                                    f'to compatible structure: {e}')
-        X = super()._validate_data(X, force_all_finite='allow-nan', 
-                                   reset=fit, ensure_2d=False, 
-                                   allow_nd=True, dtype=float)
+        X, y, sample_weight, trans_args, idx, col = \
+            _check_input(X, y, sample_weight, trans_args)
         super()._check_n_features(X, reset=fit)
-        # Check data shape, cannot rely on sklearn for 3d data.
-        if len(X.shape) != 3:
-            raise ValueError(f'Invalid X shape {X.shape}')
-        X_shape = (X.shape[0], X.shape[2])
-        if y is not None and X_shape != y.shape:
-            raise ValueError(f'X, y must have same shape except on '
-                                f'n_feature dim, received {X.shape}, '
-                                f'{y.shape}')
-        for k, v in trans_args.items():
-            if X_shape != v.shape:
-                raise ValueError(f'Any additional data must have shape '
-                                 f'(n_samples, n_firms), received '
-                                 f'{v.shape} for key {k}')
-        # Similar to sklearn's check on classifier label.
-        if y is not None and isinstance(self, ClassifierMixin):
-            if np.issubdtype(y.dtype, np.floating):
-                mask = np.isfinite(y)
-                if not (y[mask] == y[mask].astype(int)).all():
-                    raise ValueError('y cannot be continuous float.')
-            elif np.issubdtype(y.dtype, np.integer):
-                y = y.astype(float)
-            elif not np.issubdtype(y.dtype, np.str_):
-                raise ValueError(f'Require label y to be int, string or '
-                                    f'int-like float, received {y.dtype}.')
         return (X, y, sample_weight, trans_args, idx, col)
     
     def get_params(self, deep=True, raw=False):
@@ -578,7 +469,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
 
         random_state = check_random_state(self.random_state)
         X, y, sample_weight, trans_args, _, _ = \
-            self.validate_data(X, y, sample_weight, trans_args, fit=True)
+            self._validate_data(X, y, sample_weight, trans_args, fit=True)
         if isinstance(self, ClassifierMixin):
             n_samples, n_firms = y.shape
             if self.class_weight:
@@ -1373,7 +1264,6 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
         self, 
         X: Union[List[pd.DataFrame], np.ndarray], 
         trans_args: Union[None, Dict[str, np.ndarray]] = None,
-        negative: bool = False,
         transform: bool = True,
     ) -> Union[pd.DataFrame, np.ndarray]:
         """Calculate portfolio weight using the best single program
@@ -1394,14 +1284,9 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
             function. The method only check shape of these data, since it does
             not know what more to be expected.
             
-        negative : bool, default = False
-            Take the negative raw weight. This happens before transform (if
-            any) to ensure the negative weight is achievable given restrictions
-            in transformer,
-            
-        transform : bool, default = True
+        transform : bool, optional, default = True
             If set to True, would transform raw weight with self._transform
-            before returning it.
+            before returning it. Raise error if has no transformer.
 
         Returns
         -------
@@ -1421,26 +1306,19 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
             else:
                 raise NotFittedError('SymbolicRegressor not fitted.')
 
-        X, _, _, trans_args, ind, col = \
-            self.validate_data(X, None, None, trans_args, fit=False)
-        n_features = X.shape[1]
-        if self.n_features_in_ != n_features:
-            raise ValueError('Number of features of the model must match the '
-                             'input. Model n_features is %s and input '
-                             'n_features is %s.'
-                             % (self.n_features_in_, n_features))
-
-        y = self._program.execute(X)
-        if negative: y = -y
+        # Call _validate_data also checks input shape, call execute cannot.
+        X, _, _, trans_args, idx, col = \
+            self._validate_data(X, None, None, trans_args, fit=False)
+        y_pred = self._program._execute(X)
         if transform:
             if hasattr(self, '_transformer'):
                 # _Function has null parameter.
-                y = self._transformer(None, y, trans_args)
+                y_pred = self._transformer(None, y_pred, trans_args)
             else:
-                raise ValueError('Regressor has no transformer.')
-        if ind is not None:
-            y = pd.DataFrame(y, index=ind, columns=col)
-        return y
+                raise RuntimeError('Regressor has no transformer.')
+        if col is not None:
+            y_pred = pd.DataFrame(y_pred, index=idx, columns=col)
+        return y_pred
 
 
 class SymbolicPortfolio(BaseEstimator):
@@ -1497,109 +1375,14 @@ class SymbolicPortfolio(BaseEstimator):
             f'fitted={self.weights is not None}, '\
             f'n_programs={len(self.programs)})'
     
-    def validate_data(self, X, y, sample_weight, trans_args, fit=False):
-        '''Patch parent's _validate_data() method for 3-dim situation. Make it 
-        public so building blocks can rely on processed ndarray input only.
-        Due to drastic change of behavior, it is no long suitable to use 
-        sklearn's validate method.
-        
-        Support inputs of multiple DataFrame as X and single DataFrame as y. If
-        this is the case, convert them to ndarray and preserve index / columns
-        info.
-        
-        Basically a replication of ``BaseSymbolic``'s method.
-        
-        Parameters
-        ----------
-        X : List[pd.DataFrame] or array-like, shape = (n_samples, n_features,
-        n_firms)
-            See self.fit().
-
-        y : None or pd.DataFrame or array-like, shape = (n_samples, n_firms)
-            See self.fit().
-
-        sample_weight : Any
-            Weight is not supported by either method and not used here,
-            thus not validated.
-            
-        trans_args : None or dict of DataFrame / array-like
-            See self.fit().
-            
-        fit : bool, default=False
-            If set to True, overwrite regressor with inputs' feature number and
-            names, otherwise only check if they match with previous call of
-            fit.
-
-        Returns
-        -------
-        out : tuple
-            All input data converted to correct dtype and shape, plus index and
-            columns info.
+    def _validate_data(self, X, y, sample_weight, trans_args, fit=False):
+        '''Patch parent's _validate_data() method for 3-dim situation.
         '''
-        idx, col = None, None
-        # Convert X DataFrames to ndarray
-        if isinstance(X, Iterable) \
-            and all([isinstance(i, pd.DataFrame) for i in X]):
-            # warn(f'Received DataFrames as X, try converting.')
-            if isinstance(y, pd.DataFrame):
-                size, idx, col = y.shape, y.index, y.columns
-            else:
-                size, idx, col = X[0].shape, X[0].index, X[0].columns
-            if not all([i.shape==size and (i.index==idx).all() \
-                        and (i.columns==col).all() for i in X]):
-                raise ValueError('All DataFrames must have same '
-                                 'shape, indices and columns')
-            X = np.stack(
-                [check_array(i, dtype=float, force_all_finite='allow-nan') \
-                    for i in X], 
-                axis=1,
-            )
-        # Call check_array on y and other arguments.
-        if y is not None:
-            # Ensure float unless for classification task.
-            y = check_array(y, force_all_finite='allow-nan', dtype=float)
-        if trans_args is None:
-            trans_args = dict()
-        for k, v in trans_args.items():
-            if v is None:
-                del trans_args[k]
-            # Ensure 2d but no dtype check.
-            else:
-                try:
-                    trans_args[k] = check_array(v, dtype=None, 
-                                                force_all_finite='allow-nan')
-                except Exception as e:
-                    raise ValueError(f'Cannot coerce additional data {k} '
-                                    f'to compatible structure: {e}')
-        X = super()._validate_data(X, force_all_finite='allow-nan', 
-                                   reset=fit, ensure_2d=False, 
-                                   allow_nd=True, dtype=float)
+        X, y, sample_weight, trans_args, idx, col = \
+            _check_input(X, y, sample_weight, trans_args)
         super()._check_n_features(X, reset=fit)
-        # Check data shape, cannot rely on sklearn for 3d data.
-        if len(X.shape) != 3:
-            raise ValueError(f'Invalid X shape {X.shape}')
-        X_shape = (X.shape[0], X.shape[2])
-        if y is not None and X_shape != y.shape:
-            raise ValueError(f'X, y must have same shape except on '
-                                f'n_feature dim, received {X.shape}, '
-                                f'{y.shape}')
-        for k, v in trans_args.items():
-            if X_shape != v.shape:
-                raise ValueError(f'Any additional data must have shape '
-                                 f'(n_samples, n_firms), received '
-                                 f'{v.shape} for key {k}')
-        # If there is notable all-NaN period at start of X or y, warn.
-        mask = np.isnan(X).all(axis=2).any(axis=1)
-        mask |= np.isnan(y).all(axis=1)
-        idx = 0
-        while mask[idx] and (idx < len(mask)):
-            idx += 1
-        if idx > 0.1 * len(mask):
-            warn(f'There is initial NaN period in X, y for up to {idx+1} '
-                 f'days. It is recommended to drop initial NaNs to obtain '
-                 f'better performance and accurate metrics.')
         return (X, y, sample_weight, trans_args, idx, col)
-        
+    
     def fit(
         self,
         X: Union[None, List[pd.DataFrame], np.ndarray] = None, 
@@ -1653,7 +1436,7 @@ class SymbolicPortfolio(BaseEstimator):
         '''
         def _parallel_wrapper(program, X, y, trans_args):
             program = cloudpickle.loads(program)
-            pred = program.execute_transform(X, trans_args)
+            pred = program._execute_transform(X, trans_args, force=True)
             program._pnl = np.nansum(pred * y, axis=1)
             return cloudpickle.dumps(program)
         
@@ -1682,7 +1465,7 @@ class SymbolicPortfolio(BaseEstimator):
         # Get programs with PNL data.
         if X is not None:
             X, y, _, trans_args, _, _ = \
-                self.validate_data(X, y, None, trans_args, fit=True)
+                self._validate_data(X, y, None, trans_args, fit=True)
             programs = [cloudpickle.dumps(i) for i in self.programs]
             programs = Parallel(n_jobs=n_jobs, 
                                 verbose=int(self.verbose>0) * 11)(
@@ -1740,7 +1523,7 @@ class SymbolicPortfolio(BaseEstimator):
         """
         def _parallel_wrapper(program, X, trans_args):
             program = cloudpickle.loads(program)
-            weight = program.execute_transform(X, trans_args, force=True)
+            weight = program._execute_transform(X, trans_args, force=True)
             return weight
         
         if not isinstance(self.programs, Iterable) \
@@ -1751,20 +1534,21 @@ class SymbolicPortfolio(BaseEstimator):
         
         n_jobs = min(_get_n_jobs(self.n_jobs), len(self.programs))
         X, _, _, trans_args, idx, col = \
-            self.validate_data(X, None, None, trans_args, fit=True)
+            self._validate_data(X, None, None, trans_args, fit=True)
         programs = [cloudpickle.dumps(i) for i in self.programs]
         programs = Parallel(n_jobs=n_jobs, 
                             verbose=int(self.verbose>0) * 11)(
             delayed(_parallel_wrapper)(i, X, trans_args) 
                 for i in programs
         )
-        stock_weights = sum([pos * wt 
-                             for pos, wt in zip(programs, self.weights)])
+        y_pred = sum([pos * wt 
+                      for pos, wt in zip(programs, self.weights)])
         if idx is not None:
-            stock_weights = pd.DataFrame(stock_weights, index=idx, columns=col)
-        return stock_weights
+            y_pred = pd.DataFrame(y_pred, index=idx, columns=col)
+        return y_pred
     
     def _predcit_single(self, X, trans_args):
+        '''Private function using single process to evaluate programs.'''
         if not isinstance(self.programs, Iterable) \
             or not all([isinstance(i, _Program) for i in self.programs]):
             raise ValueError('Invalid candidate program list.')
@@ -1772,14 +1556,14 @@ class SymbolicPortfolio(BaseEstimator):
             raise NotFittedError(f'{self.__class__.__name__} not fitted.')
         
         X, _, _, trans_args, idx, col = \
-            self.validate_data(X, None, None, trans_args, fit=True)
-        stock_weights = np.zeros_like(X[:, 0], dtype=float)
+            self._validate_data(X, None, None, trans_args, fit=True)
+        y_pred = np.zeros_like(X[:, 0], dtype=float)
         for program, wt in zip(self.programs, self.weights):
-            pos = program.execute_transform(X, trans_args, force=True)
-            stock_weights += pos * wt
+            pos = program._execute_transform(X, trans_args, force=True)
+            y_pred += pos * wt
         if idx is not None:
-            stock_weights = pd.DataFrame(stock_weights, index=idx, columns=col)
-        return stock_weights
+            y_pred = pd.DataFrame(y_pred, index=idx, columns=col)
+        return y_pred
 
     def fit_predict(
         self,
